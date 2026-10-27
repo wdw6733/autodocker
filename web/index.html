@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoDocker · Docker 镜像自动更新</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/style.css">
+<script>
+/* 主题必须在样式表生效之前定下来，否则深色主题下会先闪一下白底再变黑。
+   这段内联脚本刻意放在 <link> 之后、<body> 之前 —— 同步执行、零等待。
+   默认深色；只有用户手动切过浅色才读 localStorage。 */
+(function () {
+  var t = 'dark';
+  try {
+    var saved = localStorage.getItem('autodocker.theme');
+    t = saved === 'light' ? 'light' : 'dark';
+  } catch (e) { /* 隐私模式下 localStorage 可能不可用，用默认值 */ }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+</head>
+<body>
+
+<div id="login" class="login-mask" hidden>
+  <form id="login-form" class="login-card">
+    <div class="login-logo"><img src="/icon-192.png" alt="AutoDocker" width="46" height="46"></div>
+    <h2>AutoDocker</h2>
+    <p class="login-sub">请输入访问账号</p>
+    <label class="login-field">
+      <span>用户名</span>
+      <input id="login-user" class="input" type="text" autocomplete="username" value="admin">
+    </label>
+    <label class="login-field">
+      <span>密码</span>
+      <input id="login-pass" class="input" type="password" autocomplete="current-password">
+    </label>
+    <p id="login-error" class="login-error" hidden></p>
+    <button class="btn primary login-btn" type="submit">登录</button>
+  </form>
+  <button id="btn-theme-login" class="btn ghost icon-btn login-theme" type="button"
+          title="切换浅色主题" aria-label="切换浅色主题">
+    <svg class="icon-moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
+    </svg>
+    <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.2" fill="currentColor"/>
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M12 2.6v2.6M12 18.8v2.6M2.6 12h2.6M18.8 12h2.6"/>
+        <path d="M5.4 5.4l1.8 1.8M16.8 16.8l1.8 1.8M18.6 5.4l-1.8 1.8M7.2 16.8l-1.8 1.8"/>
+      </g>
+    </svg>
+  </button>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div class="brand-text">
+      <h1>AutoDocker</h1>
+      <p>Docker 镜像更新监测 · 飞书确认 · 自动重建</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span id="global-status" class="pill idle">加载中</span>
+    <button id="btn-scan" class="btn primary">立即扫描</button>
+    <button id="btn-force" class="btn ghost" title="忽略去重，重新广播全部差异">强制扫描</button>
+    <button id="btn-theme" class="btn ghost icon-btn" type="button"
+            title="切换浅色主题" aria-label="切换浅色主题">
+      <svg class="icon-moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path fill="currentColor" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
+      </svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <circle cx="12" cy="12" r="4.2" fill="currentColor"/>
+        <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M12 2.6v2.6M12 18.8v2.6M2.6 12h2.6M18.8 12h2.6"/>
+          <path d="M5.4 5.4l1.8 1.8M16.8 16.8l1.8 1.8M18.6 5.4l-1.8 1.8M7.2 16.8l-1.8 1.8"/>
+        </g>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<section class="stats" id="stats"></section>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="containers">容器</button>
+  <button class="tab" data-tab="images">镜像</button>
+  <button class="tab" data-tab="tasks">更新历史</button>
+  <button class="tab" data-tab="notifications">通知</button>
+  <button class="tab" data-tab="settings">设置</button>
+</nav>
+
+<main>
+  <section id="panel-containers" class="panel active">
+    <div class="panel-head">
+      <h2>容器</h2>
+      <div class="panel-head-right">
+        <span id="batch-count" class="hint" hidden></span>
+        <button id="btn-batch-update" class="btn primary" disabled
+                title="先勾选左侧复选框，再一次性更新所有勾选的容器">批量更新</button>
+        <input id="container-search" class="input" type="search" placeholder="搜索容器或镜像">
+      </div>
+    </div>
+    <div id="containers-body" class="table-wrap"></div>
+  </section>
+
+  <section id="panel-images" class="panel">
+    <div class="panel-head">
+      <h2>镜像</h2>
+      <div class="panel-head-right">
+        <input id="image-search" class="input" type="search" placeholder="搜索镜像">
+        <button id="btn-add" class="btn ghost">添加远端监控</button>
+        <button id="btn-remove-picked" class="btn ghost danger">删除所选</button>
+        <button id="btn-clean" class="btn ghost danger">清理镜像</button>
+      </div>
+    </div>
+    <div id="images-body" class="table-wrap"></div>
+  </section>
+
+  <section id="panel-tasks" class="panel">
+    <div class="panel-head">
+      <h2>更新历史</h2>
+      <span class="hint">点击任意一行查看完整执行日志</span>
+    </div>
+    <div id="tasks-body" class="table-wrap"></div>
+  </section>
+
+  <section id="panel-notifications" class="panel">
+    <div class="panel-head">
+      <h2>更新通知</h2>
+      <div class="panel-head-right">
+        <button id="btn-read-all" class="btn ghost">全部已读</button>
+        <button id="btn-clear-read" class="btn ghost">清空已读</button>
+      </div>
+    </div>
+    <div id="notifications-body" class="table-wrap"></div>
+  </section>
+
+  <section id="panel-settings" class="panel">
+    <div class="panel-head">
+      <h2>设置</h2>
+      <span class="hint">保存后立即生效，无需重启</span>
+    </div>
+    <div class="settings-grid">
+      <form id="settings-form" class="form"></form>
+      <aside id="settings-guide" class="settings-guide"></aside>
+    </div>
+  </section>
+</main>
+
+<div id="clean-modal" class="modal" hidden>
+  <div class="modal-mask" data-close-modal="1"></div>
+  <div class="modal-card">
+    <h3>清理镜像</h3>
+    <p class="field-hint">
+      镜像层删掉就不可逆，需要时得重新拉取。正在被容器使用的镜像不会被清掉 ——
+      那些请到「容器」标签里更新。
+    </p>
+    <div class="checks">
+      <label class="check"><input type="radio" name="clean-mode" value="dangling" checked>
+        无 TAG 镜像（悬空层，重新构建后残留的那些）</label>
+      <label class="check"><input type="radio" name="clean-mode" value="unused">
+        未使用镜像（没有任何容器引用）</label>
+    </div>
+    <div id="clean-preview" class="clean-preview"></div>
+    <div class="form-actions">
+      <button type="button" class="btn danger" id="btn-clean-ok">确认清理</button>
+      <button type="button" class="btn ghost" data-close-modal="1">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-mask" data-close="1"></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <h3 id="drawer-title">详情</h3>
+      <button class="btn ghost" data-close="1">关闭</button>
+    </div>
+    <pre id="drawer-body" class="log"></pre>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

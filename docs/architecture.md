@@ -1,0 +1,148 @@
+# 技术实现
+
+> 返回 [README](../README.md)
+
+## 目录结构
+
+```
+cmd/server/         程序入口与调度
+internal/config     环境变量配置
+internal/model      领域模型
+internal/store      SQLite 持久化
+internal/dockerx    Docker Engine API 封装
+internal/registry   注册表 digest / tag 查询
+internal/version    版本号解析与比较
+internal/scanner    巡检编排（容器维度 + 镜像维度）
+internal/updater    容器重建与回滚，以及只拉镜像的更新
+internal/notify     通知路由（渠道选择、回调分发、通用投递记录）
+internal/notify/feishu    飞书卡片与长连接回调
+internal/notify/telegram  Telegram Bot API 客户端、消息与长轮询
+internal/api        REST 接口
+web/                前端单页（无需构建，go:embed 进二进制）
+
+fnos/               飞牛 fnOS 应用包源码
+  ├─ manifest       应用元数据（端口 19999 写死在这里）
+  ├─ ICON*.PNG      应用中心图标
+  ├─ app/bin/       编译出的二进制 + 启动包装脚本 run.sh
+  ├─ app/ui/config  桌面入口定义（端口同样写死）
+  ├─ cmd/           生命周期脚本（9 个：main / install / upgrade / uninstall / config）
+  ├─ wizard/        安装、配置、卸载向导表单
+  └─ config/        privilege（运行身份、docker 组）与 resource
+tools/elfcheck      打包前校验 Linux 二进制是否完整
+build-fpk.sh        一键打包成 .fpk
+Dockerfile          多阶段构建（golang → alpine，纯静态二进制）
+.dockerignore       排除 fnos / fpk / tools，只把源码送进构建上下文
+.github/workflows/docker.yml  CI：双架构构建并推 GHCR
+```
+
+## 几处刻意的技术选择
+
+**不用 Docker 官方 SDK。** `docker/docker@v27/v28` 依赖 `pkg/errors`，其 `go113.go`
+只有旧式 `// +build go1.13` 约束，Go 1.26+ 已不识别 → `errors.Is/As` 未定义、整包编译失败。
+`internal/dockerx` 直接封装 Engine REST API，`Config` / `HostConfig` 用 `map[string]any`
+原样透传 —— 反而更适合「原样还原用户配置」这个需求，不会因为 SDK 结构体字段缺失而丢东西。
+
+**SQLite 用 `modernc.org/sqlite`。** 纯 Go、免 CGO，交叉编译 arm64 只是改个环境变量。
+
+**飞书用 WebSocket 长连接收回调。** 免公网、免备案、免反向代理；卡片必须是 2.0
+（`schema: 2.0` + 按钮 `behaviors.callback`），旧版卡片的回传交互不支持长连接。
+
+**Telegram 用 `getUpdates` 长轮询收回调。** 同样免公网；轮询与 webhook 互斥，
+所以配过 webhook 的 bot 需先 `deleteWebhook`。群与频道 chat_id 是负数，
+服务只能从「bot 最近收到过消息的会话」里得知 ID —— 这也是配置流程里必须先让它说一句话的原因。
+两个渠道共用 `Notification.Channel` + `MessageID` 与回调状态，
+加新渠道只需实现「发一条带按钮的消息」「改这条消息」「处理一次回调」三件事。
+
+**加速地址三层兜底：`用户设置 → 守护进程 registry-mirrors → 内置默认`。**
+默认值刻意**不写进环境变量默认值**，否则中间那层永远进不去。
+加速地址只作用于 Docker Hub —— 公共加速站基本只缓存 Hub，把 ghcr.io / quay.io
+也改发过去只会换来一片 404。
+
+## 重建容器的保真规则
+
+这是出错代价最高的一段，改动前先看 `internal/updater/updater_test.go`。
+照抄 `inspect` 结果反而会出错，所以要主动修正：
+
+| 规则 | 为什么 |
+| --- | --- |
+| `Config.Image` **必须覆盖**成本次目标引用 | 照抄 inspect 会重建出仍跑着旧镜像的容器，「出现更高版本 tag」场景直接失效 |
+| 自动分配的 `Hostname`（=旧容器短 ID）清掉，用户手写的 `--hostname` 保留 | 两个容器不能同名，新容器带着旧 container ID 会起不来 |
+| 内置网络（`bridge`/`host`/`none`/`nat`）**不写进** `NetworkingConfig` | 写进去会被守护进程拒绝，是 host 网络容器更新失败最常见的原因 |
+| 网络端点只搬 `IPAMConfig`/`Links`/`Aliases`/`DriverOpts` | `NetworkID`/`EndpointID`/`Gateway`/`IPAddress`/`MacAddress` 由运行时填充，原样回传会被当成「用户指定了 IP」而报地址冲突 |
+| `container:` 网络模式**完全不传**端点 | 网络由被共享的容器决定，自己指定会冲突 |
+| 匿名卷（镜像 `VOLUME` 声明、隐式创建的卷）**显式补回原卷名** | 否则数据会落到新空卷上 |
+
+回滚链路是「停旧 → 改名 `<原名>-old-<时间戳>` → 建新 → 健康检查」，
+所以回滚是有现场保障的，不是「删了重建」。
+
+## 存储上容易踩的坑
+
+- **`CREATE TABLE IF NOT EXISTS` 对已存在的表一个字段都不补** —— 加列必须走 `ALTER TABLE`
+  （`store.imageAddedColumns` + `PRAGMA table_info`），否则 SELECT 报 `no such column`，
+  页面整体白掉。
+- `UpsertImage` 的 `ON CONFLICT DO UPDATE` **不能带上 `ignored` / `ignored_digest` /
+  `mode` / `baseline_at`** —— 这些是用户侧设定，每轮扫描盖上等于没设。
+- 异步任务用 `context.Background()`，不能用 handler 的 `r.Context()`（返回即撤销）。
+
+## 前端约定
+
+- **`display` 和 `hidden` 别混**：`style.css` 顶部有全局兜底
+  `[hidden] { display: none !important; }`。曾因 `.login-mask { display: flex }` 压过它，
+  表现为「登录成功却一直停在登录页」。新增浮层别删这条。
+- 列宽用 `flex: 0 0 <px>` 固定，否则「当前 / 可用 / 状态」会逐行错位。
+- `.btn.danger` 与 `.btn.ghost` 特异性相同 → 必须写 `.btn.danger:not(.ghost)`。
+- **`data-theme` 必须在 `<head>` 内联脚本里同步写入**，不能等 `app.js` 加载后再改，
+  否则深色主题会先闪一下白底。改这段脚本要保持同步执行、且排在样式表之后。
+- **禁用 `color-mix()`**：飞牛桌面用内置 WebView 加载页面，Chromium 版本可能较旧；
+  该函数不被支持时整条 `background` 声明会被判无效，主按钮直接掉成灰底。
+  提亮用 `filter: brightness()`。
+- `web/` 下新增资源**必须同步进 `web/embed.go` 的 `//go:embed` 列表**
+  （显式文件名列表，漏了直接编译报错）。
+
+## 图标资源
+
+应用图标与网页图标是**同一张图的两种规格**，白底已抠成透明并做过边缘反混合
+（源图是没有任何 alpha 通道的 RGB 白底图，直接放深色桌面上四个角会露出白边）：
+
+| 文件 | 用途 |
+| --- | --- |
+| `fnos/ICON.PNG` / `fnos/ICON_256.PNG` | 应用中心与桌面入口图标（64 / 256） |
+| `fnos/app/ui/images/icon_64.png` / `icon_256.png` | 与之同源，打包时一并放进 ui 目录 |
+| `web/favicon.ico` | 浏览器标签页图标（16/32/48 三档） |
+| `web/icon-192.png` | 登录页 logo（`<img src="/icon-192.png">`）与 apple-touch-icon |
+
+- 抠底脚本在 `tools/icon-transparent.py`：靠 flood fill 从四角灌水定出形状（灌不到的就是内部的
+  白色箭头），再按填充色反解 alpha。**注意 `Image.fromarray()` 返回的是只读图像，
+  `ImageDraw.floodfill` 在它上面会静默失效**（不报错也不生效），必须先 `.copy()`。
+- 改图后要跑 `tools/icon-scan.py` 复核四角 α 是否为 0，并用
+  「合成回白底能否逐像素还原原图」来验证反混合是否干净。
+
+## 测试
+
+```bash
+go test ./...
+```
+
+Requires Go 1.26+。覆盖的是**本地无法用眼睛验证、出错代价又最高**的那几处：
+
+- `internal/updater` —— 重建配置的还原：镜像引用覆盖、Hostname 处理、匿名卷补齐、
+  内置网络剔除、`-v` 表达式里容器内路径的解析；
+- `internal/notify` —— 「点了更新按钮到底去拉哪个镜像」的判定；
+- `internal/notify/feishu` —— 卡片 2.0 结构约束：`schema`、`body.elements`、
+  按钮 `behaviors.callback` 及其 `value`；测试卡片的按钮回传载荷；
+- `internal/scanner` —— 通知标题与正文的措辞（含「不该出现内部术语」的反向断言）；
+  以及「忽略本版本」的抑制边界：远端摘要没变就不推、变了照推；
+- `internal/store` —— 首页统计的**口径**必须只数容器，本机镜像与纯远端项不能计入；
+  「已忽略版本」的标记要能扛住下一轮扫描的 upsert、并在恢复监控时被清掉；
+- `internal/version` —— 版本号比较，含「预发布版不能高于正式版」「tag 结尾的架构号
+  （`v3-386` 的 `386`）不算版本段」这类容易写反的规则；
+- `internal/registry` —— 镜像引用解析、tag 替换、Docker Hub 写法归一；
+  **加速源路由**（只接管 Docker Hub、按序回退、多源失败原因聚合）；
+  加速地址解析（协议头、结尾斜杠、多种分隔符、去重保序）；
+  **回环地址自动走 http** 的判定（含「私有网段不该被误判」的反向断言）。
+
+交叉编译：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o autodocker ./cmd/server
+```

@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# 升级后：补可执行位、给老配置补齐新增项，然后把服务拉起来。
+#
+# 为什么要在升级脚本里补配置项：config.env 一旦生成就不会被覆盖，
+# 新版本引入的配置项对老用户永远不生效，只能在这里显式补。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+ENV_FILE="${TRIM_PKGETC}/config.env"
+
+chmod +x "${TRIM_APPDEST}/bin/autodocker" 2>/dev/null
+chmod +x "${TRIM_APPDEST}/bin/run.sh" 2>/dev/null
+if [ -n "$CMD_DIR" ]; then
+    chmod +x "${CMD_DIR}"/* 2>/dev/null
+fi
+
+append_if_missing() {
+    key="$1"
+    value="$2"
+    if [ -f "$ENV_FILE" ] && ! grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        printf '%s=%q\n' "$key" "$value" >> "$ENV_FILE"
+    fi
+}
+
+append_if_missing SCAN_INTERVAL "3600"
+append_if_missing REGISTRY_MIRROR ""
+append_if_missing FEISHU_APP_ID ""
+append_if_missing FEISHU_APP_SECRET ""
+append_if_missing FEISHU_CHAT_ID ""
+
+drop_key() {
+    key="$1"
+    [ -f "$ENV_FILE" ] || return 0
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        tmp="${ENV_FILE}.tmp"
+        grep -v "^${key}=" "$ENV_FILE" > "$tmp" 2>/dev/null
+        mv "$tmp" "$ENV_FILE"
+    fi
+}
+
+# 1.0.2 起访问密码改由网页「设置」维护，并且**默认不启用登录**。
+# 老版本的安装向导把密码写进了这里，不主动清掉的话，升级完照样会弹登录框，
+# 用户会以为「说好的免登录」根本没生效。真要加这道门的人，
+# 进应用「设置」里填一次即可 —— 那份存在数据库里，优先级也更高。
+drop_key ADMIN_USER
+drop_key ADMIN_PASSWORD
+
+if [ -f "$ENV_FILE" ]; then
+    chmod 600 "$ENV_FILE" 2>/dev/null
+fi
+
+# 应用中心通常会在升级后自动拉起，重复 start 是幂等的（内部会先判 status）
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" start
+fi
+
+exit 0

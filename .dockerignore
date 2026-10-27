@@ -1,0 +1,29 @@
+.git
+.gitignore
+
+# 本地记忆与编辑器的临时产物（里面有内部笔记，不该进构建上下文）
+.workbuddy
+_probe
+node_modules
+
+# 运行时数据
+data
+*.db
+*.db-shm
+*.db-wal
+
+# 飞牛应用包与打包中间产物
+# fnos/app/bin/autodocker 是 13 MB 的 linux 二进制，纯属白传
+Autodocker.fpk
+*.fpk
+fnos
+dist
+tools
+build-fpk.sh
+
+# 文档与编排文件：镜像里用不到，改它们也不该触发重新构建
+# （Dockerfile / .dockerignore 刻意不排除 —— 官方虽然保证它们仍会送给 builder，
+#  但某些第三方构建器不实现这个例外，排掉了会报 "Dockerfile not found"）
+README.md
+docker-compose.yml
+.github

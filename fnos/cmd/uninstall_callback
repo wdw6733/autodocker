@@ -1,0 +1,22 @@
+#!/bin/bash
+#
+# 卸载清理：按用户在向导里的选择决定要不要连数据一起删。
+# 默认保留数据库，这样重新安装后监控列表与更新历史都还在。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop
+fi
+
+if [ "${wizard_data_action:-keep}" = "remove" ]; then
+    # 用 ${VAR:?} 拦住变量为空的情况 —— 万一 TRIM_PKGVAR 没传进来，
+    # 这条命令会变成 rm -rf /*，必须先让它在这里失败。
+    if [ -n "${TRIM_PKGVAR:-}" ] && [ "${TRIM_PKGVAR}" != "/" ]; then
+        rm -rf "${TRIM_PKGVAR:?}"/* 2>/dev/null
+    fi
+    rm -f "${TRIM_PKGETC:?}/config.env" 2>/dev/null
+fi
+
+exit 0

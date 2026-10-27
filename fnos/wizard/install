@@ -1,0 +1,33 @@
+[
+  {
+    "stepTitle": "巡检设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "这几项以后都能在应用页面的「设置」里随时修改，先按默认值装好也没问题。飞书通知也在那里配置，装完进入应用即可。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_scan_interval",
+        "label": "自动巡检间隔",
+        "initValue": "3600",
+        "options": [
+          { "label": "每 30 分钟", "value": "1800" },
+          { "label": "每 1 小时（推荐）", "value": "3600" },
+          { "label": "每 6 小时", "value": "21600" },
+          { "label": "每天一次", "value": "86400" },
+          { "label": "关闭定时巡检，只手动扫描", "value": "0" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_registry_mirror",
+        "label": "镜像加速地址（可留空）"
+      },
+      {
+        "type": "tips",
+        "helpText": "国内网络直连 Docker Hub 基本不通，这一栏留空也不会出问题：程序会先沿用 Docker 守护进程里配好的加速器，都没有则用内置默认（docker.1ms.run / docker.xuanyuan.me）。要自己指定就填这里，多个地址用英文逗号分隔、按顺序回退。装好后在应用「设置」里同样能改。"
+      }
+    ]
+  }
+]

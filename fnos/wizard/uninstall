@@ -1,0 +1,21 @@
+[
+  {
+    "stepTitle": "卸载选项",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载后应用程序会被移除。下面可以选择是否同时清除本应用积累的监控数据。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_data_action",
+        "label": "监控数据",
+        "initValue": "keep",
+        "options": [
+          { "label": "保留数据库与更新历史（推荐）", "value": "keep" },
+          { "label": "一并删除全部数据", "value": "remove" }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,29 @@
+# 数据目录（SQLite 数据库）
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# 构建产物
+/autodocker
+/autodocker.exe
+*.exe
+/dist/
+
+# 飞牛 fnOS 应用包与其中的二进制（由 build-fpk.sh 生成）
+/*.fpk
+/fnos/app/bin/autodocker
+/fnos/app/bin/autodocker.exe
+
+# 环境与编辑器
+.env
+.env.local
+.idea/
+.vscode/
+.DS_Store
+
+# 临时探针目录（本地验证用，勿提交）
+_probe/
+
+# 工作笔记与验证截图：属于本地过程产物，推上去只会让仓库变胖
+.workbuddy/

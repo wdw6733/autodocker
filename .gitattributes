@@ -1,0 +1,8 @@
+# 统一用 LF。仓库里有 shell 脚本（fnos/cmd/*、build-fpk.sh），
+# Windows 上若按 autocrlf 检出成 CRLF，拷到飞牛上会报 bad interpreter。
+* text=auto eol=lf
+
+# 二进制不要做换行转换，也不要尝试 diff
+*.png binary
+*.ico binary
+*.fpk binary

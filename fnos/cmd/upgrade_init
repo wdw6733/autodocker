@@ -1,0 +1,12 @@
+#!/bin/bash
+#
+# 升级前：先把服务停掉，避免正在运行的二进制被占用、旧配置残留。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop
+fi
+
+exit 0
