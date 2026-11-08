@@ -166,6 +166,8 @@ func (l *LongConn) onCardAction(ctx context.Context, event *callback.CardActionT
 			Toast: &callback.Toast{Type: "error", Content: "操作数据无效"},
 		}, nil
 	}
+	// 把「点按钮时所在的群」带进载荷，业务侧据此拒绝被转发到别群的更新请求。
+	value.ChatID = chatIDFromEvent(event)
 
 	// 事件上下文在响应返回后即失效，这里用独立的 Background 交给业务侧异步处理
 	toast, card := l.handler.HandleCardAction(context.Background(), value)
@@ -195,4 +197,13 @@ func toCardValue(m map[string]interface{}) (CardValue, error) {
 		return v, err
 	}
 	return v, nil
+}
+
+// chatIDFromEvent 从卡片回调事件上下文里取实际来源群。
+// 取不到时返回空串 —— 调用方应把空串视为「来源不明」并拒绝更新类动作。
+func chatIDFromEvent(event *callback.CardActionTriggerEvent) string {
+	if event == nil || event.Event == nil || event.Event.Context == nil {
+		return ""
+	}
+	return event.Event.Context.OpenChatID
 }

@@ -20,6 +20,8 @@ const (
 	ActionIgnore = "ignore"
 	ActionSnooze = "snooze"
 	ActionTest   = "test"
+	// ActionBatch 是批量汇总消息上「全部更新」按钮的动作，NID 字段此时承载批次 ID。
+	ActionBatch = "batch"
 )
 
 // Button 一行内联按钮。
@@ -205,6 +207,48 @@ func BuildStateMessage(n *model.Notification, state model.CardState, detail stri
 		m.Rows = [][]Button{{{Text: "🔁 重试更新", Data: base.Encode()}}}
 	}
 	return m
+}
+
+// BuildBatchMessage 构造「发现多个更新」的汇总消息，带一个「全部更新」按钮。
+func BuildBatchMessage(items []model.Notification, batchID int64) Message {
+	lines := []string{
+		fmt.Sprintf("🗂 <b>本次巡检发现 %d 个容器可更新</b>", len(items)),
+		"",
+	}
+	for i, n := range items {
+		name := n.ContainerName
+		if name == "" {
+			name = n.ImageRef
+		}
+		lines = append(lines, fmt.Sprintf("%d. <code>%s</code> — <code>%s</code>", i+1, esc(name), esc(n.ImageRef)))
+		if len(lines) > 20 {
+			lines = append(lines, fmt.Sprintf("…共 %d 个容器", len(items)))
+			break
+		}
+	}
+	lines = append(lines,
+		"",
+		"<i>点击下方按钮一次性串行更新：逐个拉取新镜像并按原配置重建，单个失败不影响其余。</i>",
+	)
+	return Message{
+		Text: strings.Join(lines, "\n"),
+		Rows: [][]Button{
+			{
+				{Text: "🚀 全部更新", Data: CallbackValue{Action: ActionBatch, NID: batchID}.Encode()},
+			},
+		},
+	}
+}
+
+// BuildBatchStateMessage 批量更新完成后的汇总状态消息。
+func BuildBatchStateMessage(total int, summary string) Message {
+	return Message{Text: strings.Join([]string{
+		"✅ <b>批量更新完成</b>",
+		"",
+		fmt.Sprintf("共 <b>%d</b> 个容器的批量更新已全部处理。%s", total, esc(summary)),
+		"",
+		"<i>每个容器的具体结果可在网页「更新历史」中查看。</i>",
+	}, "\n")}
 }
 
 // BuildTestMessage 连通性测试消息，**带一个可点的按钮**。

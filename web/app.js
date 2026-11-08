@@ -16,6 +16,8 @@ const state = {
   imageSearch: '',
   // 镜像页勾选的镜像 ID。清理是批量操作，靠它决定删哪些。
   picked: new Set(),
+  // 容器页勾选「批量更新」的监控项 ID（存字符串，与 picked 保持一致）。
+  batchPicked: new Set(),
 };
 
 /* ---------- 登录态 ---------- */
@@ -366,6 +368,13 @@ function renderContainers() {
         : '<div class="cell-main mono">—</div>');
     return `
     <div class="row" data-id="${img.id}">
+      <div class="cell col-pick">${
+        canUpdate
+          ? `<input type="checkbox" data-batch-pick="${img.id}"
+                   ${state.batchPicked.has(String(img.id)) ? 'checked' : ''}
+                   title="勾选后点右上角「批量更新」一起重建">`
+          : ''
+      }</div>
       <div class="cell grow">
         <div class="cell-main">${esc(img.container_name || '—')}</div>
         <div class="cell-sub">${esc(img.reference)}</div>
@@ -402,6 +411,19 @@ function renderContainers() {
   }).join('');
 
   $('#containers-body').innerHTML = html;
+  updateBatchBar();
+}
+
+/* 容器页顶部「批量更新」按钮和已选计数。 */
+function updateBatchBar() {
+  const count = state.batchPicked.size;
+  const bar = $('#batch-count');
+  const btn = $('#btn-batch-update');
+  if (bar) {
+    bar.hidden = !count;
+    bar.textContent = `已选 ${count} 个`;
+  }
+  if (btn) btn.disabled = !count;
 }
 
 /* 镜像列表：本机真实存在的镜像（含没被任何容器使用的），
@@ -917,6 +939,12 @@ async function loadStats() {
 async function loadContainers() {
   const data = await api('/api/containers');
   state.containers = data.items || [];
+  // 丢掉已不存在、或不再可更新的勾选，免得按钮指向空气。
+  const alive = new Set(state.containers
+    .filter((i) => i.container_id &&
+      (i.status === 'update_available' || i.status === 'new_version_tag'))
+    .map((i) => String(i.id)));
+  state.batchPicked.forEach((id) => { if (!alive.has(id)) state.batchPicked.delete(id); });
   renderContainers();
 }
 
@@ -986,6 +1014,33 @@ async function triggerUpdate(imageId) {
     refresh();
   } catch (e) {
     toast('无法更新：' + e.message, 'danger');
+  }
+}
+
+// 批量更新：把容器页勾选的监控项一次性交给后端串行重建。
+async function triggerBatchUpdate() {
+  const ids = Array.from(state.batchPicked).map(Number).filter(Boolean);
+  if (!ids.length) {
+    toast('先勾选要更新的容器', 'warn');
+    return;
+  }
+  const names = state.containers
+    .filter((i) => state.batchPicked.has(String(i.id)))
+    .map((i) => i.container_name || i.reference);
+  if (!confirm(`确认批量更新以下 ${ids.length} 个容器？\n\n${names.join('、')}\n\n单个失败不会影响其余容器，进度可在「更新历史」查看。`)) return;
+
+  try {
+    const res = await api('/api/update-batch', {
+      method: 'POST',
+      body: JSON.stringify({ image_ids: ids }),
+    });
+    state.batchPicked.clear();
+    updateBatchBar();
+    const skipped = res.skipped ? `，跳过 ${res.skipped} 个` : '';
+    toast(`已开始批量更新 ${res.total} 个容器${skipped}，进度可在「更新历史」查看`);
+    refresh();
+  } catch (e) {
+    toast('批量更新失败：' + e.message, 'danger');
   }
 }
 
@@ -1615,6 +1670,7 @@ document.addEventListener('click', async (ev) => {
 
   if (ev.target.id === 'btn-scan') doScan(false);
   if (ev.target.id === 'btn-force') doScan(true);
+  if (ev.target.id === 'btn-batch-update') triggerBatchUpdate();
   if (ev.target.id === 'btn-test-notify') testNotify();
   if (ev.target.id === 'btn-tg-chats') loadTelegramChats();
   if (ev.target.id === 'btn-tg-check') checkTelegram();
@@ -1665,6 +1721,15 @@ document.addEventListener('change', (ev) => {
     const id = pick.dataset.pick;
     if (pick.checked) state.picked.add(id);
     else state.picked.delete(id);
+    return;
+  }
+
+  const batchPick = ev.target.closest('input[data-batch-pick]');
+  if (batchPick) {
+    const id = batchPick.dataset.batchPick;
+    if (batchPick.checked) state.batchPicked.add(id);
+    else state.batchPicked.delete(id);
+    updateBatchBar();
     return;
   }
 

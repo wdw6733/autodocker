@@ -16,6 +16,8 @@ const (
 	// ActionTest 是测试卡片上那个按钮的动作：它不关联任何通知，
 	// 唯一目的就是让服务端确认「按钮回调这条链路真的通」。
 	ActionTest = "test"
+	// ActionBatch 是批量汇总卡上「全部更新」按钮的动作，NID 字段此时承载批次 ID。
+	ActionBatch = "batch"
 )
 
 // CardValue 卡片按钮点击后回传给服务的载荷。
@@ -26,6 +28,9 @@ type CardValue struct {
 	Ref    string `json:"ref"`
 	CID    string `json:"cid"`
 	Name   string `json:"name"`
+	// ChatID 是回调到达时由长连接层从事件上下文填的「实际来源群」。
+	// 它不写进按钮载荷（json:"-"），只用于服务端校验「点按钮的人在哪」。
+	ChatID string `json:"-"`
 }
 
 // 注意：这里统一使用**卡片 2.0**（schema=2.0）格式。
@@ -144,6 +149,43 @@ func BuildUpdateCard(n *model.Notification) map[string]any {
 		noteElement("AutoDocker · 点击即完成容器重建，原有挂载、端口与网络配置会完整保留"),
 	}
 	return card2(template, n.Title, elements)
+}
+
+// BuildBatchCard 构造「发现多个更新」的汇总卡片，带一个「全部更新」按钮。
+// items 里每个元素是一条待更新通知；点击按钮后按批次串行重建全部容器。
+func BuildBatchCard(items []model.Notification, batchID int64) map[string]any {
+	lines := make([]string, 0, len(items)+1)
+	for i, n := range items {
+		name := n.ContainerName
+		if name == "" {
+			name = n.ImageRef
+		}
+		lines = append(lines, fmt.Sprintf("**%d. %s**：%s", i+1, name, n.ImageRef))
+	}
+	if len(items) > 6 {
+		lines = append(lines, fmt.Sprintf("…共 %d 个容器", len(items)))
+	}
+
+	elements := []any{
+		mdElement(fmt.Sprintf("本次巡检发现 **%d 个容器**可更新，点击下方按钮一次性串行更新：", len(items))),
+		hrElement(),
+		mdElement(strings.Join(lines, "\n")),
+		hrElement(),
+		buttonRow(
+			buttonElement("全部更新", "primary_filled", CardValue{Action: ActionBatch, NID: batchID}),
+		),
+		noteElement("逐个拉取新镜像并按原配置重建，单个失败不影响其余，全部完成后本卡片自动更新结果"),
+	}
+	return card2("orange", "批量更新", elements)
+}
+
+// BuildBatchStateCard 批量更新完成后的汇总状态卡片。
+func BuildBatchStateCard(total int, summary string) map[string]any {
+	return card2("green", "批量更新完成", []any{
+		mdElement(fmt.Sprintf("**共 %d 个容器**的批量更新已全部处理。\n%s", total, summary)),
+		hrElement(),
+		noteElement("每个容器的具体结果可在网页「更新历史」中查看"),
+	})
 }
 
 // BuildStateCard 构造状态卡片：更新中 / 成功 / 失败 / 已忽略 / 已稍后。

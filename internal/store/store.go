@@ -134,6 +134,22 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_scans_started ON scans(started_at DESC)`,
 
+		`CREATE TABLE IF NOT EXISTS update_batches (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			status       TEXT    NOT NULL DEFAULT 'pending',
+			triggered_by TEXT    NOT NULL DEFAULT '',
+			total        INTEGER NOT NULL DEFAULT 0,
+			succeeded    INTEGER NOT NULL DEFAULT 0,
+			failed       INTEGER NOT NULL DEFAULT 0,
+			rolled_back  INTEGER NOT NULL DEFAULT 0,
+			skipped      INTEGER NOT NULL DEFAULT 0,
+			items        TEXT    NOT NULL DEFAULT '',
+			deliveries   TEXT    NOT NULL DEFAULT '',
+			created_at   INTEGER NOT NULL DEFAULT 0,
+			finished_at  INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_batches_created ON update_batches(created_at DESC)`,
+
 		`CREATE TABLE IF NOT EXISTS settings (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL DEFAULT ''
@@ -176,12 +192,20 @@ var notificationAddedColumns = []struct{ name, ddl string }{
 	{"deliveries", "TEXT NOT NULL DEFAULT ''"},
 }
 
+// taskAddedColumns 是批量更新功能为 tasks 表新增的列。
+var taskAddedColumns = []struct{ name, ddl string }{
+	{"batch_id", "INTEGER NOT NULL DEFAULT 0"},
+}
+
 // addMissingColumns 给老库补上新增的列。
 func (s *Store) addMissingColumns() error {
 	if err := s.addImageColumns(); err != nil {
 		return err
 	}
-	return s.addNotificationColumns()
+	if err := s.addNotificationColumns(); err != nil {
+		return err
+	}
+	return s.addTaskColumns()
 }
 
 func (s *Store) addImageColumns() error {
@@ -230,6 +254,23 @@ func (s *Store) addNotificationColumns() error {
 			`UPDATE notifications SET channel = 'feishu', message_id = feishu_message_id WHERE message_id = ''`,
 		); err != nil {
 			return fmt.Errorf("回填消息 ID 失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// addTaskColumns 给老库的 tasks 表补上 batch_id。
+func (s *Store) addTaskColumns() error {
+	have, err := s.tableColumns("tasks")
+	if err != nil {
+		return err
+	}
+	for _, col := range taskAddedColumns {
+		if have[col.name] {
+			continue
+		}
+		if _, err := s.db.Exec("ALTER TABLE tasks ADD COLUMN " + col.name + " " + col.ddl); err != nil {
+			return fmt.Errorf("补列 %s 失败: %w", col.name, err)
 		}
 	}
 	return nil

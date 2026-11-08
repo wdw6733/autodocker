@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -699,6 +700,25 @@ type manualUpdateReq struct {
 	ImageID        int64 `json:"image_id"`
 }
 
+// notificationFromImage 从监控项构造一条「立即更新」用的通知快照。
+// 页面上的「立即更新」没有对应的通知行，这里现拼一条，走与聊天按钮完全相同的落地逻辑。
+func notificationFromImage(img *model.Image) *model.Notification {
+	kind := model.NotifNewVersion
+	if img.LatestTag != "" && img.LatestTag != img.LocalTag {
+		kind = model.NotifNewTag
+	}
+	return &model.Notification{
+		ImageRef:      img.Reference,
+		ContainerID:   img.ContainerID,
+		ContainerName: img.ContainerName,
+		Kind:          kind,
+		LocalTag:      img.LocalTag,
+		LatestTag:     img.LatestTag,
+		LocalSummary:  "",
+		RemoteSummary: "",
+	}
+}
+
 // handleManualUpdate 从页面手动触发更新（与飞书按钮等价）。
 func (s *Server) handleManualUpdate(w http.ResponseWriter, r *http.Request) {
 	var in manualUpdateReq
@@ -722,23 +742,7 @@ func (s *Server) handleManualUpdate(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "监控项不存在")
 			return
 		}
-		// 从监控项直接发起更新（页面上「立即更新」按钮）。
-		// LatestTag 非空即代表这是「发现更高版本 tag」的场景，
-		// 据此标记 Kind，后续取目标引用与实际拉取的镜像都靠它。
-		kind := model.NotifNewVersion
-		if img.LatestTag != "" && img.LatestTag != img.LocalTag {
-			kind = model.NotifNewTag
-		}
-		n = &model.Notification{
-			ImageRef:      img.Reference,
-			ContainerID:   img.ContainerID,
-			ContainerName: img.ContainerName,
-			Kind:          kind,
-			LocalTag:      img.LocalTag,
-			LatestTag:     img.LatestTag,
-			LocalSummary:  "",
-			RemoteSummary: "",
-		}
+		n = notificationFromImage(img)
 	default:
 		writeErr(w, http.StatusBadRequest, "需要提供 notification_id 或 image_id")
 		return
@@ -752,8 +756,86 @@ func (s *Server) handleManualUpdate(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"task_id": taskID})
 }
 
+type batchUpdateReq struct {
+	ImageIDs []int64 `json:"image_ids"`
+}
+
+// handleBatchUpdate 一次更新多个容器：把所选监控项拼成一批，串行重建。
+func (s *Server) handleBatchUpdate(w http.ResponseWriter, r *http.Request) {
+	var in batchUpdateReq
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误: "+err.Error())
+		return
+	}
+	if len(in.ImageIDs) == 0 {
+		writeErr(w, http.StatusBadRequest, "没有选择要更新的容器")
+		return
+	}
+	if len(in.ImageIDs) > 100 {
+		writeErr(w, http.StatusBadRequest, "单次批量更新最多 100 个容器")
+		return
+	}
+
+	// 逐个读监控项并拼成通知快照；无效 ID 直接整体拒绝，避免「部分更新了才报错」。
+	notifs := make([]model.Notification, 0, len(in.ImageIDs))
+	for _, id := range in.ImageIDs {
+		img, err := s.st.GetImage(id)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "监控项不存在: #"+strconv.FormatInt(id, 10))
+			return
+		}
+		notifs = append(notifs, *notificationFromImage(img))
+	}
+
+	batchID, total, skipped, err := s.nt.TriggerBatchUpdate(notifs, "web")
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{
+		"batch_id": batchID,
+		"total":    total,
+		"skipped":  skipped,
+	})
+}
+
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	writeOK(w, s.LoadSettings())
+	out := s.LoadSettings()
+	maskSecrets(&out)
+	writeOK(w, out)
+}
+
+// secretMask 是敏感字段在 GET 回显时使用的占位符。
+// 前端原样带回该值时，PUT 端理解为「未改动，保留旧值」。
+// 用纯 ASCII 星号：避免个别终端 / 字体把 Unicode 圆点渲染成问号，
+// 也避免前端做字符串比较时踩编码坑。
+const secretMask = "********"
+
+// maskSecrets 对凭据类字段脱敏：页面拿不到明文，就不会被局域网里的
+// 任意浏览器 / 脚本窃走（本服务挂载 docker.sock，等同宿主机 root）。
+func maskSecrets(in *model.Settings) {
+	if in.FeishuAppSecret != "" {
+		in.FeishuAppSecret = secretMask
+	}
+	if in.TelegramBotToken != "" {
+		in.TelegramBotToken = secretMask
+	}
+	if in.AdminPassword != "" {
+		in.AdminPassword = secretMask
+	}
+}
+
+// keepMaskedSecrets 把「未改动」的掩码值还原成数据库里的旧值。
+func keepMaskedSecrets(in *model.Settings, prev model.Settings) {
+	if in.FeishuAppSecret == secretMask {
+		in.FeishuAppSecret = prev.FeishuAppSecret
+	}
+	if in.TelegramBotToken == secretMask {
+		in.TelegramBotToken = prev.TelegramBotToken
+	}
+	if in.AdminPassword == secretMask {
+		in.AdminPassword = prev.AdminPassword
+	}
 }
 
 // handlePutSettings 保存运行时设置并即时生效。
@@ -775,12 +857,18 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "健康检查等待时间需在 0-600 秒之间")
 		return
 	}
+	// 掩码值 = 未改动，保留旧凭据。
+	keepMaskedSecrets(&in, s.LoadSettings())
 	if err := s.saveSettings(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败: "+err.Error())
 		return
 	}
 	s.ApplySettings(in)
-	writeOK(w, s.LoadSettings())
+	// 回显也要脱敏：保存成功后前端会拿这份回包刷新表单，
+	// 若这里返回明文，刚才的 GET 脱敏就白做了。
+	out := s.LoadSettings()
+	maskSecrets(&out)
+	writeOK(w, out)
 }
 
 func (s *Server) handleFeishuTest(w http.ResponseWriter, r *http.Request) {
@@ -841,7 +929,7 @@ func (s *Server) handleTelegramCheck(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&in)
 
 	cfg := telegram.Config{
-		Token:   firstNonEmpty(in.Token, s.nt.Telegram().Token()),
+		Token:   firstNonEmpty(unmask(in.Token), s.nt.Telegram().Token()),
 		APIBase: firstNonEmpty(in.APIBase, s.nt.Telegram().APIBase()),
 		Proxy:   firstNonEmpty(in.Proxy, s.nt.Telegram().Proxy()),
 	}
@@ -875,6 +963,14 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// unmask 把脱敏占位符还原为空串，避免检测接口把掩码当成真凭据去用。
+func unmask(v string) string {
+	if v == secretMask {
+		return ""
+	}
+	return v
 }
 
 // handleTelegramStatus 汇报 Telegram 链路状态。

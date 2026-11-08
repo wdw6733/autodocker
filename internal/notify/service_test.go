@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +88,7 @@ func TestActionConstantsAligned(t *testing.T) {
 		{"ignore", ActionIgnore, feishu.ActionIgnore},
 		{"snooze", ActionSnooze, feishu.ActionSnooze},
 		{"test", ActionTest, feishu.ActionTest},
+		{"batch", ActionBatch, feishu.ActionBatch},
 	}
 	for _, p := range pairs {
 		if p.a != p.b {
@@ -98,6 +100,7 @@ func TestActionConstantsAligned(t *testing.T) {
 		{"ignore", ActionIgnore, telegram.ActionIgnore},
 		{"snooze", ActionSnooze, telegram.ActionSnooze},
 		{"test", ActionTest, telegram.ActionTest},
+		{"batch", ActionBatch, telegram.ActionBatch},
 	}
 	for _, p := range tgPairs {
 		if p.a != p.b {
@@ -230,5 +233,116 @@ func TestDeliveryTargetsFallsBackToPrimary(t *testing.T) {
 	none := &model.Notification{}
 	if got := s.deliveryTargets(none); got != nil {
 		t.Fatalf("既无投递列表也无主投递时应返回 nil，得到 %+v", got)
+	}
+}
+
+// 批量输入的边界校验必须被钉死：
+//   - 没有本地容器的条目不能进批次（纯远端监控项更新不了任何容器）；
+//   - 同一个容器只执行一次，重复项直接去重；
+//   - 超过单批上限的条目带着原因跳过。
+func TestFilterBatchItemsDedupAndSkip(t *testing.T) {
+	items := []model.Notification{
+		{ContainerID: "c1", ContainerName: "web", ImageRef: "nginx:1.25", LatestTag: "1.27"},
+		{ContainerID: "", ContainerName: "watch-only", ImageRef: "ghcr.io/foo/bar:latest"},
+		{ContainerID: "c1", ContainerName: "web-dup", ImageRef: "nginx:1.25"},
+		{ContainerID: "c2", ContainerName: "db", ImageRef: "redis:7"},
+	}
+
+	accepted, skips := filterBatchItems(items)
+	if len(accepted) != 2 {
+		t.Fatalf("应受理 2 个（c1、c2），实际 %d: %+v", len(accepted), accepted)
+	}
+	if accepted[0].ContainerID != "c1" || accepted[1].ContainerID != "c2" {
+		t.Fatalf("受理顺序应为 c1、c2，得到 %+v", accepted)
+	}
+	if len(skips) != 1 || skips[0].ContainerName != "watch-only" {
+		t.Fatalf("应只跳过无容器条目，得到 %+v", skips)
+	}
+}
+
+// 超限的条目要被挡在批次之外，且跳过原因明确。
+func TestFilterBatchItemsCapsAtLimit(t *testing.T) {
+	items := make([]model.Notification, 0, maxBatchItems+2)
+	for i := 0; i < maxBatchItems+2; i++ {
+		items = append(items, model.Notification{
+			ContainerID:   "c" + strconv.Itoa(i),
+			ContainerName: "c" + strconv.Itoa(i),
+		})
+	}
+
+	accepted, skips := filterBatchItems(items)
+	if len(accepted) != maxBatchItems {
+		t.Fatalf("应正好受理 %d 个，实际 %d", maxBatchItems, len(accepted))
+	}
+	if len(skips) != 2 {
+		t.Fatalf("应跳过 2 个超限项，实际 %d", len(skips))
+	}
+	for _, s := range skips {
+		if s.Reason != "超出单次批量上限" {
+			t.Fatalf("超限项的跳过原因应明确，得到 %q", s.Reason)
+		}
+	}
+}
+
+// 批量条目的目标引用与单容器更新共用同一套语义：
+// 有更高版本 tag 时拉新 tag，浮动 tag 内容变更时拉原引用。
+func TestBatchTargetRefUsesLatestTag(t *testing.T) {
+	upgrade := batchTargetRef(model.BatchItem{ImageRef: "nginx:1.25", LatestTag: "1.27"})
+	if upgrade != "nginx:1.27" {
+		t.Fatalf("出现更高版本 tag 时应拉新 tag，得到 %q", upgrade)
+	}
+
+	floating := batchTargetRef(model.BatchItem{ImageRef: "nginx:latest", LatestTag: ""})
+	if floating != "nginx:latest" {
+		t.Fatalf("浮动 tag 内容变更应拉原引用，得到 %q", floating)
+	}
+
+	sameTag := batchTargetRef(model.BatchItem{ImageRef: "nginx:1.25", LatestTag: "1.25"})
+	if sameTag != "nginx:1.25" {
+		t.Fatalf("LatestTag 与当前 tag 相同时不应改变引用，得到 %q", sameTag)
+	}
+}
+
+// 没有任何就绪渠道时，批量汇总直接不打扰，返回 0 批次 ID。
+func TestNotifyBatchNoChannelReturnsZero(t *testing.T) {
+	s := quietService()
+	s.fs = feishu.New(feishu.Config{})
+	s.tg = telegram.New(telegram.Config{})
+
+	items := []model.Notification{
+		{ContainerID: "c1", ContainerName: "web"},
+		{ContainerID: "c2", ContainerName: "db"},
+	}
+	id, err := s.NotifyBatch(context.Background(), items)
+	if err != nil {
+		t.Fatalf("无渠道时应静默跳过而不是报错，得到 %v", err)
+	}
+	if id != 0 {
+		t.Fatalf("无渠道时批次 ID 应为 0，得到 %d", id)
+	}
+}
+
+// 飞书的更新/批量按钮只认默认接收群：卡片被转发到别的群后，
+// 那里的人不该能远程重建本机容器。来源群对不上时必须在碰数据库之前拒绝。
+func TestHandleCardActionRejectsForeignChatForUpdate(t *testing.T) {
+	s := quietService()
+	s.fs = feishu.New(feishu.Config{AppID: "cli_x", AppSecret: "secret", ChatID: "oc_default"})
+
+	toast, card := s.HandleCardAction(context.Background(), feishu.CardValue{
+		Action: feishu.ActionUpdate, NID: 1, ChatID: "oc_other",
+	})
+	if !strings.Contains(toast, "默认接收群") {
+		t.Fatalf("非默认群的更新应被拒绝，得到 %q", toast)
+	}
+	if card != nil {
+		t.Fatal("拒绝时不应返回卡片")
+	}
+
+	// 来源群缺失（老事件 / 特殊宿主）同样拒绝，不能退化成放行。
+	toast, _ = s.HandleCardAction(context.Background(), feishu.CardValue{
+		Action: feishu.ActionBatch, NID: 12,
+	})
+	if !strings.Contains(toast, "默认接收群") {
+		t.Fatalf("来源不明的批量更新应被拒绝，得到 %q", toast)
 	}
 }

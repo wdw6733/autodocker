@@ -199,6 +199,7 @@ const (
 // Task 一次容器更新任务。
 type Task struct {
 	ID             int64      `json:"id"`
+	BatchID        int64      `json:"batch_id"` // 所属批量更新批次，0 表示单次更新
 	NotificationID int64      `json:"notification_id"`
 	ImageRef       string     `json:"image_ref"`
 	ContainerID    string     `json:"container_id"`
@@ -212,6 +213,46 @@ type Task struct {
 	StartedAt      *time.Time `json:"started_at"`
 	FinishedAt     *time.Time `json:"finished_at"`
 	CreatedAt      time.Time  `json:"created_at"`
+}
+
+// BatchStatus 批量更新批次状态。
+type BatchStatus string
+
+const (
+	BatchPending BatchStatus = "pending" // 已创建，等待执行
+	BatchRunning BatchStatus = "running" // 执行中
+	BatchDone    BatchStatus = "done"    // 全部处理完（含部分失败）
+)
+
+// BatchItem 批量更新里的一个条目：就是一条待更新的通知快照。
+// 直接存 Notification 的好处是执行时不再依赖「那张卡片还在不在」——
+// 通知可能已被清掉或状态已变，但批次的语义是「当时点下按钮那一刻要更新的那些容器」。
+type BatchItem struct {
+	NotificationID int64            `json:"notification_id"`
+	ImageRef       string           `json:"image_ref"`
+	ContainerID    string           `json:"container_id"`
+	ContainerName  string           `json:"container_name"`
+	Kind           NotificationKind `json:"kind"`
+	LocalTag       string           `json:"local_tag"`
+	LatestTag      string           `json:"latest_tag"`
+	LocalSummary   string           `json:"local_summary"`
+	RemoteSummary  string           `json:"remote_summary"`
+}
+
+// UpdateBatch 一次批量更新批次。items 与 deliveries 以 JSON 持久化。
+type UpdateBatch struct {
+	ID          int64        `json:"id"`
+	Status      BatchStatus  `json:"status"`
+	TriggeredBy string       `json:"triggered_by"`
+	Total       int          `json:"total"`
+	Succeeded   int          `json:"succeeded"`
+	Failed      int          `json:"failed"`
+	RolledBack  int          `json:"rolled_back"`
+	Skipped     int          `json:"skipped"`
+	Items       []BatchItem  `json:"items"`
+	Deliveries  []Delivery   `json:"deliveries,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	FinishedAt  *time.Time   `json:"finished_at"`
 }
 
 // Scan 一次扫描记录。

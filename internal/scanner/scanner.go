@@ -25,6 +25,9 @@ var ErrScanRunning = errors.New("已有扫描正在执行")
 type Notifier interface {
 	// Notify 推送一条更新提醒，返回平台侧的消息 ID（用于后续更新卡片状态）。
 	Notify(ctx context.Context, n *model.Notification) (string, error)
+	// NotifyBatch 一次扫描发现多个可更新项时推送批量汇总卡，返回批次 ID。
+	// 实现方自行决定是否真的推送（例如可更新项不足两个时不打扰）。
+	NotifyBatch(ctx context.Context, items []model.Notification) (int64, error)
 }
 
 // Options 扫描配置。
@@ -54,6 +57,10 @@ type Scanner struct {
 
 	mu       sync.Mutex
 	scanning bool
+
+	// 本轮扫描中产生的待更新通知（有本地容器的），扫描结束后用于批量汇总卡。
+	batchMu    sync.Mutex
+	batchItems []model.Notification
 }
 
 // New 构造巡检器。
@@ -103,6 +110,11 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 		s.scanning = false
 		s.mu.Unlock()
 	}()
+
+	// 清空上一轮残留的批量候选。
+	s.batchMu.Lock()
+	s.batchItems = nil
+	s.batchMu.Unlock()
 
 	scanID, err := s.st.CreateScan(force)
 	if err != nil {
@@ -164,6 +176,9 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 	if _, derr := s.st.DeleteImagesMissing(live); derr != nil {
 		s.log.Warn("清理失效监控项失败", "err", derr)
 	}
+
+	// 本轮发现多个可更新容器时，补一张「全部更新」的批量汇总卡。
+	s.maybeNotifyBatch(ctx)
 
 	if err := s.st.FinishScan(scanID, total, withUpdate, notified, ""); err != nil {
 		s.log.Warn("写入扫描结果失败", "err", err)
@@ -600,6 +615,13 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 	}
 	n.ID = id
 
+	// 记入本轮批量候选：只有带本地容器的条目才能被「全部更新」。
+	if n.ContainerID != "" {
+		s.batchMu.Lock()
+		s.batchItems = append(s.batchItems, *n)
+		s.batchMu.Unlock()
+	}
+
 	s.mu.Lock()
 	notifier := s.notifier
 	s.mu.Unlock()
@@ -620,6 +642,29 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 		_ = s.st.SetNotificationDeliveries(id, n.Deliveries, model.CardPending)
 	}
 	return true
+}
+
+// maybeNotifyBatch 把本轮收集到的可更新通知交给通知层，由其决定是否推批量汇总卡。
+func (s *Scanner) maybeNotifyBatch(ctx context.Context) {
+	s.batchMu.Lock()
+	items := s.batchItems
+	s.batchItems = nil
+	s.batchMu.Unlock()
+
+	if len(items) < 2 {
+		return
+	}
+	s.mu.Lock()
+	notifier := s.notifier
+	s.mu.Unlock()
+	if notifier == nil {
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := notifier.NotifyBatch(pushCtx, items); err != nil {
+		s.log.Warn("推送批量汇总失败", "err", err)
+	}
 }
 
 // buildText 生成通知标题与正文。
