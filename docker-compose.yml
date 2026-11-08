@@ -1,0 +1,73 @@
+services:
+  autodocker:
+    container_name: autodocker
+    # 默认 latest，`docker compose pull` 即可升级。
+    # 想锁死版本就把 latest 换成具体版本号，例如 1.2.3。
+    image: haihaipypy/autodocker:latest
+    # 从源码本地构建（需要整个仓库）：注释掉上面 image，打开下面两行。
+    # build: .
+    # image: autodocker:dev
+    restart: unless-stopped
+    ports:
+      # 换端口时两处要一致：左边宿主机端口 + 下面的 PORT。
+      - "17777:17777"
+    volumes:
+      # 必须挂载：这是监控与重建容器的基础
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=17777
+      - DB_PATH=/data/autodocker.db
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+      # 自身容器名：用于阻止「更新自己」这种自杀行为
+      - SELF_CONTAINER=autodocker
+
+      # 巡检间隔（秒）。0 表示关闭定时扫描，仅手动触发
+      - SCAN_INTERVAL=3600
+
+      # 更新策略：默认「发现更新 → 通知 → 等人确认」。
+      # 若想发现即自动更新，把下一行打开（这是无人值守模式，请先确认回滚策略可用）
+      # - AUTO_UPDATE=true
+
+      # 额外监控本机没有运行的镜像（逗号分隔，纯远端巡检）
+      # - WATCH=nginx:1.25,redis:7.2
+
+      # ---- 通知渠道（默认留空：不填就只是不推通知）----
+      # 在网页「设置 → 通知渠道」里选和填，下面这些只作首次启动的初值。
+      # 同一时刻只用一个渠道：feishu / telegram
+      # - NOTIFY_CHANNEL=feishu
+
+      # ---- 飞书通知 ----
+      # 必须是「企业自建应用」，群自定义机器人（webhook）收不到按钮点击。
+      - FEISHU_APP_ID=
+      - FEISHU_APP_SECRET=
+      - FEISHU_CHAT_ID=
+
+      # ---- Telegram 通知 ----
+      # Token 找 @BotFather 发 /newbot 拿；chat_id 可在设置页点「读取会话」自动填。
+      # - TELEGRAM_BOT_TOKEN=
+      # - TELEGRAM_CHAT_ID=
+      # 直连 api.telegram.org 不通时填自建反代地址（不带 /bot 后缀）
+      # - TELEGRAM_API_BASE=
+
+      # ---- 网页登录（默认留空：不启用登录）----
+      # 要让端口离开内网，务必设上密码。
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=
+
+      # ---- 更新策略 ----
+      # 更新失败自动回滚到旧容器
+      - ROLLBACK_ON_FAILURE=true
+      # 更新成功后保留旧容器（默认删除）
+      - KEEP_OLD_CONTAINER=false
+      # 新容器健康检查观察窗口（秒）
+      - HEALTH_CHECK_WAIT=20
+
+      # ---- 可选：国内加速 / 私有注册表代理 ----
+      # 留空即按「Docker 守护进程的 registry-mirrors → 内置默认」兜底，
+      # 内置默认是 docker.1ms.run,docker.xuanyuan.me
+      # - REGISTRY_MIRROR=docker.1ms.run,docker.xuanyuan.me
+      # - REGISTRY_INSECURE=false
+      # - REGISTRY_AUTH=docker.io=user:pass,ghcr.io=ghp_xxx

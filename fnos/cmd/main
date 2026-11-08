@@ -1,0 +1,122 @@
+#!/bin/bash
+#
+# Autodocker 运行控制：start / stop / status
+# 退出码约定：0 = 成功或正在运行；1 = 失败；3 = status 时表示未运行。
+#
+# 服务端口 19999 同时写死在 manifest.service_port、app/ui/config 与 run.sh，
+# 改端口时必须三处同步修改。
+#
+# 日志只有一条写入路径：服务进程写 stdout，这里的重定向负责落盘。
+# 千万不要让进程内部再单独写一份同样的日志，否则每行会重复出现两遍。
+
+TRIM_PKGVAR="${TRIM_PKGVAR:-/tmp}"
+LOG_FILE="${TRIM_PKGVAR}/autodocker.log"
+PID_FILE="${TRIM_PKGVAR}/autodocker.pid"
+
+# 脚本自身的目录（cmd/ 与 target 是两处不同路径，用 $0 定位最稳）
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+# 程序目录：优先用系统给的变量，取不到就从 cmd 目录往上找
+APPDEST="${TRIM_APPDEST:-$(cd "${CMD_DIR}/.." 2>/dev/null && pwd)}"
+
+log_msg() {
+    echo "[fnos] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+check_process() {
+    kill -0 "$1" 2>/dev/null
+}
+
+status() {
+    if [ -r "$PID_FILE" ]; then
+        pid="$(head -n 1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$pid" ] && check_process "$pid"; then
+            return 0
+        fi
+        # 进程已不在，清掉过期的 pid 文件
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+start_process() {
+    if status; then
+        log_msg "服务已在运行，跳过重复启动"
+        return 0
+    fi
+
+    # fpk 打包会丢掉可执行位，每次启动都补一次最保险
+    chmod +x "${APPDEST}/bin/autodocker" 2>/dev/null
+    chmod +x "${APPDEST}/bin/run.sh" 2>/dev/null
+
+    if [ ! -f "${TRIM_PKGETC}/config.env" ]; then
+        log_msg "缺少 ${TRIM_PKGETC}/config.env"
+        echo "应用配置缺失，请卸载后重新安装 Autodocker。" > "$TRIM_TEMP_LOGFILE"
+        return 1
+    fi
+
+    log_msg "正在启动 Autodocker ..."
+    nohup bash "${APPDEST}/bin/run.sh" >> "$LOG_FILE" 2>&1 &
+    pid=$!
+    printf '%s' "$pid" > "$PID_FILE"
+
+    # 给进程一点时间暴露启动期错误（端口占用、配置非法、二进制缺可执行位等）
+    sleep 3
+    if check_process "$pid"; then
+        log_msg "启动完成 pid=${pid}"
+        return 0
+    fi
+
+    log_msg "启动失败，详情见 ${LOG_FILE}"
+    rm -f "$PID_FILE"
+    echo "Autodocker 启动失败，请查看日志 ${LOG_FILE}。" > "$TRIM_TEMP_LOGFILE"
+    return 1
+}
+
+stop_process() {
+    log_msg "正在停止 Autodocker ..."
+
+    if [ -r "$PID_FILE" ]; then
+        pid="$(head -n 1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$pid" ] && check_process "$pid"; then
+            kill -TERM "$pid" 2>/dev/null
+
+            n=0
+            while check_process "$pid" && [ "$n" -lt 15 ]; do
+                sleep 1
+                n=$((n + 1))
+            done
+
+            if check_process "$pid"; then
+                log_msg "进程未响应 TERM，改用 KILL"
+                kill -KILL "$pid" 2>/dev/null
+                sleep 1
+            fi
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    # 兜底：pid 文件可能丢失或指向已复用的进程号，按可执行文件路径收一次尾
+    pkill -f "${APPDEST}/bin/autodocker" 2>/dev/null
+
+    log_msg "已停止"
+    return 0
+}
+
+case "$1" in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

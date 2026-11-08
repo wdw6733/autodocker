@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# 配置变更后：把向导里的新值写回 config.env，然后重启服务。
+#
+# 两条规矩：
+#   1. 留空 = 保持原值。飞牛的配置向导不会回填当前值，表单提交上来的空字段
+#      如果直接覆盖，用户只改个巡检间隔就会把飞书配置一起清空。
+#   2. 单行替换而不是整份重写，避免把没在表单里出现的项（以后新增的）弄丢。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+ENV_FILE="${TRIM_PKGETC}/config.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "配置文件缺失：${ENV_FILE}" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+# 写入单个键；值统一用 %q 转义，空格与引号都不会破坏格式
+set_env() {
+    key="$1"
+    value="$2"
+    line="$(printf '%s=%q' "$key" "$value")"
+    tmp="${ENV_FILE}.tmp"
+
+    grep -v "^${key}=" "$ENV_FILE" > "$tmp" 2>/dev/null
+    printf '%s\n' "$line" >> "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null
+}
+
+# 访问密码不在这里改：安装向导已不再收集，默认不启用登录。
+# 需要加一道门就在应用「设置」里填，保存即生效、连长连接之外的所有组件都会同步。
+# 飞书凭据同理。
+if [ -n "${wizard_registry_mirror:-}" ]; then
+    set_env REGISTRY_MIRROR "$wizard_registry_mirror"
+fi
+
+# 巡检间隔是唯一允许写 0 的项（0 = 关闭定时巡检），空串表示保持原值
+case "${wizard_scan_interval:-}" in
+"" | *[!0-9]*) ;;
+*)
+    set_env SCAN_INTERVAL "$wizard_scan_interval"
+    ;;
+esac
+
+# 重启使新配置生效。config_init 可能已被系统调用过，这里再做一次是幂等的。
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop
+    "${CMD_DIR}/main" start
+fi
+
+exit 0

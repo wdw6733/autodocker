@@ -1,0 +1,8 @@
+{
+    "defaults": {
+        "run-as": "package"
+    },
+    "username": "autodocker",
+    "groupname": "autodocker",
+    "join-groups": ["docker"]
+}

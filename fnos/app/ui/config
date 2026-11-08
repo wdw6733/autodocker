@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "Autodocker.Main": {
+            "title": "Docker 更新助手",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "19999",
+            "url": "/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}

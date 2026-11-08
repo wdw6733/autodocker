@@ -1,0 +1,12 @@
+#!/bin/bash
+#
+# 配置变更前：停掉服务，保证新配置生效时不出现新旧并存。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop
+fi
+
+exit 0

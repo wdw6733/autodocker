@@ -1,0 +1,12 @@
+#!/bin/bash
+#
+# 卸载前：先停服务，避免卸载过程中进程还在往数据目录写。
+
+set -u
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$CMD_DIR" ] && [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop
+fi
+
+exit 0

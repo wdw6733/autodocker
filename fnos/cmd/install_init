@@ -1,0 +1,28 @@
+#!/bin/bash
+#
+# 安装前检查：确认飞牛上已经跑着 Docker 守护进程。
+#
+# 这里刻意不做硬性拦截 —— 用户完全可能先装本应用、再装 Docker 应用。
+# 只把提醒写进日志与用户可见信息，真正的连接失败会在服务启动后显示在页面上。
+
+set -u
+
+SOCK=""
+for candidate in /var/run/docker.sock /run/docker.sock /var/run/docker.sock.raw; do
+    if [ -S "$candidate" ]; then
+        SOCK="$candidate"
+        break
+    fi
+done
+
+if [ -z "$SOCK" ]; then
+    echo "未检测到 Docker 守护进程（/var/run/docker.sock）。请先在飞牛应用中心安装并启动 Docker，否则本应用无法读取容器列表。" > "$TRIM_TEMP_LOGFILE"
+    exit 0
+fi
+
+# 顺便确认应用用户能读这个 socket，否则后面会一直报权限错误
+if [ ! -r "$SOCK" ]; then
+    echo "检测到 Docker（${SOCK}），但当前应用用户没有读取权限。若启动后看不到容器，请检查应用的 docker 用户组配置。" > "$TRIM_TEMP_LOGFILE"
+fi
+
+exit 0

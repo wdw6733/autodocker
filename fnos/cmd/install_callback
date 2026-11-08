@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# 安装后：把向导收集到的值落盘成 config.env，并补齐可执行位与数据目录。
+
+set -u
+
+ENV_FILE="${TRIM_PKGETC}/config.env"
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+
+mkdir -p "${TRIM_PKGVAR}" "${TRIM_PKGETC}" 2>/dev/null
+
+# fpk 打包会丢失可执行位，装完立刻补回来
+chmod +x "${TRIM_APPDEST}/bin/autodocker" 2>/dev/null
+chmod +x "${TRIM_APPDEST}/bin/run.sh" 2>/dev/null
+if [ -n "$CMD_DIR" ]; then
+    chmod +x "${CMD_DIR}"/* 2>/dev/null
+fi
+
+# 安装向导不再收集登录账号密码：默认直接进页面，不弹登录框。
+# 需要给访问加一道门时，在应用「设置」里填访问密码即可（保存即生效），
+# 或者手工往 config.env 里追加 ADMIN_USER / ADMIN_PASSWORD。
+
+# 用 %q 转义写入，值里带空格、引号、$ 都不会破坏文件格式。
+# 文件只对应用用户可读（umask 077 + chmod 600）。
+#
+# 飞书凭据刻意不在这里写：安装向导已经不收集它了，改为装好后在应用页面的
+# 「设置」里填，存在数据库里、保存即生效。想用环境变量预置的高级用法，
+# 手工往这个文件里追加 FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID 即可，
+# run.sh 会原样导出成环境变量，作为首次启动的初值（数据库里已保存的值优先）。
+umask 077
+{
+    printf 'SCAN_INTERVAL=%q\n' "${wizard_scan_interval:-3600}"
+    printf 'REGISTRY_MIRROR=%q\n' "${wizard_registry_mirror:-}"
+} > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+echo "[fnos] $(date '+%Y-%m-%d %H:%M:%S') - 安装完成，配置已写入 ${ENV_FILE}" >> "${TRIM_PKGVAR}/autodocker.log" 2>/dev/null
+
+exit 0
