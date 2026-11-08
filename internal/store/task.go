@@ -8,7 +8,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/model"
 )
 
-const taskCols = `id, notification_id, image_ref, container_id, container_name, new_container_id,
+const taskCols = `id, batch_id, notification_id, image_ref, container_id, container_name, new_container_id,
 	status, triggered_by, log, error, backup_name, started_at, finished_at, created_at`
 
 func scanTask(sc rowScanner) (model.Task, error) {
@@ -19,7 +19,7 @@ func scanTask(sc rowScanner) (model.Task, error) {
 		createdAt  int64
 	)
 	err := sc.Scan(
-		&t.ID, &t.NotificationID, &t.ImageRef, &t.ContainerID, &t.ContainerName, &t.NewContainerID,
+		&t.ID, &t.BatchID, &t.NotificationID, &t.ImageRef, &t.ContainerID, &t.ContainerName, &t.NewContainerID,
 		&t.Status, &t.TriggeredBy, &t.Log, &t.Error, &t.BackupName,
 		&startedAt, &finishedAt, &createdAt,
 	)
@@ -43,11 +43,11 @@ func (s *Store) CreateTask(t *model.Task) (int64, error) {
 	}
 	var id int64
 	err := s.db.QueryRow(`
-		INSERT INTO tasks(notification_id, image_ref, container_id, container_name,
+		INSERT INTO tasks(batch_id, notification_id, image_ref, container_id, container_name,
 			status, triggered_by, log, error, backup_name, created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		RETURNING id`,
-		t.NotificationID, t.ImageRef, t.ContainerID, t.ContainerName,
+		t.BatchID, t.NotificationID, t.ImageRef, t.ContainerID, t.ContainerName,
 		string(t.Status), t.TriggeredBy, t.Log, t.Error, t.BackupName, timeToTs(t.CreatedAt),
 	).Scan(&id)
 	if err != nil {

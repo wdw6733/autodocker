@@ -132,6 +132,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks", s.handleListTasks)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleTaskDetail)
 	mux.HandleFunc("POST /api/update", s.handleManualUpdate)
+	mux.HandleFunc("POST /api/update-batch", s.handleBatchUpdate)
 
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)

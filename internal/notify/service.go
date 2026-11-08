@@ -40,6 +40,8 @@ const (
 	ActionIgnore = "ignore"
 	ActionSnooze = "snooze"
 	ActionTest   = "test"
+	// ActionBatch 是批量汇总卡上「全部更新」按钮的动作，NID 字段此时承载批次 ID。
+	ActionBatch = "batch"
 )
 
 // settingDingTalkChats 钉钉会话列表在 settings 表里的 key。
@@ -138,6 +140,12 @@ type Service struct {
 	cbAction string
 	cbChan   model.Channel
 	cbCount  int
+
+	// 批量更新队列的单飞标志。批量与单容器更新共用一个 Updater，
+	// 但排队要在 Service 层再做一层：防止两个批次同时入队、也防止
+	// 单容器更新在批次等待执行时插队。
+	batchMu     sync.Mutex
+	batchActive bool
 }
 
 // New 构造通知服务。baseCtx 用于派生异步更新任务的上下文。
@@ -631,6 +639,133 @@ func (s *Service) Notify(ctx context.Context, n *model.Notification) (string, er
 	return deliveries[0].MessageID, nil
 }
 
+// NotifyBatch 一次扫描发现多个可更新项时，额外推送一张批量汇总卡。
+// 汇总卡上的「全部更新」按钮承载批次 ID，点击后按批次串行重建全部容器。
+// 返回批次 ID；没有就绪渠道或可更新项不足两个时返回 0（不打扰）。
+func (s *Service) NotifyBatch(ctx context.Context, items []model.Notification) (int64, error) {
+	chans := s.readyChannels()
+	if len(chans) == 0 {
+		return 0, nil
+	}
+
+	filtered := make([]model.Notification, 0, len(items))
+	for _, it := range items {
+		if it.ContainerID != "" {
+			filtered = append(filtered, it)
+		}
+	}
+	if len(filtered) < 2 {
+		return 0, nil
+	}
+
+	batch := &model.UpdateBatch{
+		Status:      model.BatchPending,
+		TriggeredBy: "scan",
+		Total:       len(filtered),
+		Items:       batchItemsFromNotifications(filtered),
+	}
+	batchID, err := s.st.CreateBatch(batch)
+	if err != nil {
+		return 0, err
+	}
+
+	var (
+		deliveries []model.Delivery
+		failures   []string
+	)
+	for _, ch := range chans {
+		switch ch {
+		case model.ChannelTelegram:
+			chatID := s.tg.DefaultChatID()
+			msgID, err := s.tg.SendMessage(ctx, chatID, telegram.BuildBatchMessage(filtered, batchID))
+			if err != nil {
+				failures = append(failures, "Telegram："+err.Error())
+				s.log.Warn("Telegram 批量汇总推送失败", "err", err)
+				continue
+			}
+			deliveries = append(deliveries, model.Delivery{
+				Channel: model.ChannelTelegram, ChatRef: chatID, MessageID: strconv.FormatInt(msgID, 10),
+			})
+		case model.ChannelFeishu:
+			chatID := s.fs.DefaultChatID()
+			msgID, err := s.fs.SendCard(ctx, "", feishu.BuildBatchCard(filtered, batchID))
+			if err != nil {
+				failures = append(failures, "飞书："+err.Error())
+				s.log.Warn("飞书批量汇总推送失败", "err", err)
+				continue
+			}
+			deliveries = append(deliveries, model.Delivery{
+				Channel: model.ChannelFeishu, ChatRef: chatID, MessageID: msgID,
+			})
+		}
+	}
+
+	if len(deliveries) == 0 {
+		return batchID, errors.New("所有通知渠道都发送失败：" + strings.Join(failures, "；"))
+	}
+	if err := s.st.SetBatchDeliveries(batchID, deliveries); err != nil {
+		s.log.Warn("记录批量汇总投递坐标失败", "err", err)
+	}
+	s.log.Info("已推送批量汇总", "batch", batchID, "total", len(filtered))
+	return batchID, nil
+}
+
+// batchItemsFromNotifications 把通知列表转成批次条目快照。
+func batchItemsFromNotifications(items []model.Notification) []model.BatchItem {
+	out := make([]model.BatchItem, 0, len(items))
+	for _, n := range items {
+		out = append(out, model.BatchItem{
+			NotificationID: n.ID,
+			ImageRef:       n.ImageRef,
+			ContainerID:    n.ContainerID,
+			ContainerName:  n.ContainerName,
+			Kind:           n.Kind,
+			LocalTag:       n.LocalTag,
+			LatestTag:      n.LatestTag,
+			LocalSummary:   n.LocalSummary,
+			RemoteSummary:  n.RemoteSummary,
+		})
+	}
+	return out
+}
+
+// triggerBatchFromID 处理聊天渠道「全部更新」按钮：按批次 ID 取快照并批量执行。
+func (s *Service) triggerBatchFromID(batchID int64, from model.Channel) (int64, int, error) {
+	batch, err := s.st.GetBatch(batchID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return 0, 0, errors.New("批次不存在或已失效")
+		}
+		return 0, 0, errors.New("读取批次失败")
+	}
+	if batch.Status != model.BatchPending {
+		return 0, 0, errors.New("该批次已处理过，不能重复执行")
+	}
+
+	notifs := make([]model.Notification, 0, len(batch.Items))
+	for _, it := range batch.Items {
+		notifs = append(notifs, model.Notification{
+			ID:            it.NotificationID,
+			ImageRef:      it.ImageRef,
+			ContainerID:   it.ContainerID,
+			ContainerName: it.ContainerName,
+			Kind:          it.Kind,
+			LocalTag:      it.LocalTag,
+			LatestTag:     it.LatestTag,
+			LocalSummary:  it.LocalSummary,
+			RemoteSummary: it.RemoteSummary,
+		})
+	}
+
+	id, total, _, err := s.TriggerBatchUpdate(notifs, string(from))
+	if err != nil {
+		return 0, 0, err
+	}
+	// 标记批次已进入执行，避免重复点击再次触发。
+	_ = s.st.UpdateBatchProgress(batchID, model.BatchRunning, 0, 0, 0, 0)
+	return id, total, nil
+}
+
 // handleCardAction 实现 feishu.ActionHandler：处理飞书卡片按钮点击。
 //
 // 必须在 3 秒内返回，因此这里只创建任务并立刻返回「进行中」的卡片，
@@ -644,6 +779,28 @@ func (s *Service) HandleCardAction(ctx context.Context, v feishu.CardValue) (str
 	if v.Action == ActionTest {
 		s.log.Info("收到飞书测试卡片回调，按钮链路正常")
 		return "回调已收到", feishu.BuildTestDoneCard(at)
+	}
+
+	// 安全：更新类动作只认默认接收群。卡片被转发到别的群后，那里的人
+	// 不该能远程重建本机容器（docker.sock 等同 root）。
+	// ChatID 由长连接层从事件上下文填入；缺省或对不上默认群一律拒绝。
+	if v.Action == ActionUpdate || v.Action == ActionBatch {
+		if expected := s.fs.DefaultChatID(); expected == "" || v.ChatID == "" || v.ChatID != expected {
+			s.log.Warn("拒绝来源不明的飞书更新请求", "chat", v.ChatID, "action", v.Action)
+			return "无权操作：请在本应用的默认接收群中操作", nil
+		}
+	}
+
+	// 批量汇总卡的「全部更新」按钮：NID 承载批次 ID，不关联单条通知。
+	if v.Action == ActionBatch {
+		if v.NID <= 0 {
+			return "批次无效", nil
+		}
+		_, total, err := s.triggerBatchFromID(v.NID, model.ChannelFeishu)
+		if err != nil {
+			return "无法批量更新：" + err.Error(), nil
+		}
+		return fmt.Sprintf("已开始批量更新 %d 个容器", total), feishu.BuildBatchStateCard(total, "正在逐个拉取镜像并重建，完成后本卡片自动更新结果。")
 	}
 
 	n, err := s.st.GetNotification(v.NID)
@@ -672,6 +829,29 @@ func (s *Service) HandleCallback(ctx context.Context, v telegram.CallbackValue, 
 		s.log.Info("收到 Telegram 测试消息回调，按钮链路正常")
 		m := telegram.BuildTestDoneMessage(at)
 		return "回调已收到", &m
+	}
+
+	// 安全：更新类动作只认默认会话。bot 被拉进别的群后，那里的人不该能
+	// 远程重建本机容器（docker.sock 等同 root）。
+	if v.Action == ActionUpdate || v.Action == ActionBatch {
+		expected := s.tg.DefaultChatID()
+		if expected == "" || chatID != expected {
+			s.log.Warn("拒绝非默认会话的更新请求", "chat", chatID, "action", v.Action)
+			return "无权操作：请在本 bot 的默认接收会话中操作", nil
+		}
+	}
+
+	// 批量汇总消息的「全部更新」按钮：NID 承载批次 ID，不关联单条通知。
+	if v.Action == ActionBatch {
+		if v.NID <= 0 {
+			return "批次无效", nil
+		}
+		_, total, err := s.triggerBatchFromID(v.NID, model.ChannelTelegram)
+		if err != nil {
+			return "无法批量更新：" + err.Error(), nil
+		}
+		m := telegram.BuildBatchStateMessage(total, "正在逐个拉取镜像并重建，完成后本消息自动更新结果。")
+		return fmt.Sprintf("已开始批量更新 %d 个容器", total), &m
 	}
 
 	n, err := s.st.GetNotification(v.NID)
@@ -1080,6 +1260,9 @@ func (s *Service) TriggerUpdate(n *model.Notification, triggeredBy string) (int6
 	if n.ContainerID == "" {
 		return 0, errors.New("该监控项没有关联的本地容器，无法执行更新")
 	}
+	if s.batchBusy() {
+		return 0, errors.New("有批量更新任务正在执行，请稍后再试")
+	}
 	if s.up.Busy() {
 		return 0, errors.New("已有更新任务正在执行，请稍后重试")
 	}
@@ -1126,6 +1309,11 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 		TriggeredBy:   triggeredBy,
 	})
 
+	s.finishUpdate(n, taskID, err)
+}
+
+// finishUpdate 把一次更新的最终结果写回通知卡片/消息。
+func (s *Service) finishUpdate(n *model.Notification, taskID int64, err error) {
 	state := model.CardDone
 	detail := "容器已在新镜像上重建完成，原有挂载、端口与网络配置保持不变。"
 	if err != nil {
@@ -1137,7 +1325,7 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 		}
 	}
 
-	if n.ID > 0 {
+	if n != nil && n.ID > 0 {
 		if serr := s.st.SetNotificationCardState(n.ID, state); serr != nil {
 			s.log.Warn("写回通知状态失败", "err", serr)
 		}
@@ -1147,6 +1335,9 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 	// 原地替换原消息，形成可追溯的操作记录。
 	// 两个渠道各发过一份，就必须两条都改 —— 漏掉的那条会永远停在「待更新」，
 	// 用户点进去还以为是没生效。
+	if n == nil {
+		return
+	}
 	targets := s.deliveryTargets(n)
 	if len(targets) == 0 {
 		return
@@ -1155,6 +1346,248 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 	defer cancelPush()
 	for _, d := range targets {
 		s.editDelivery(pushCtx, n, d, state, detail)
+	}
+}
+
+// batchBusy 是否有批量更新任务正在排队或执行。
+func (s *Service) batchBusy() bool {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	return s.batchActive
+}
+
+// BatchSkip 批量入队时被跳过的条目。
+type BatchSkip struct {
+	ContainerName string `json:"container_name"`
+	Reason        string `json:"reason"`
+}
+
+// maxBatchItems 单次批量更新最多处理的容器数，防止误触或攻击时无脑重建整机。
+const maxBatchItems = 30
+
+// TriggerBatchUpdate 把一批容器加入同一批次并异步串行执行。
+// items 是「点击那一刻」的快照：之后通知被清、状态被改都不影响本批次。
+// 返回批次 ID 与已受理的任务数；跳过的条目带原因返回。
+func (s *Service) TriggerBatchUpdate(items []model.Notification, triggeredBy string) (int64, int, []BatchSkip, error) {
+	// 1. 过滤 + 去重 + 限量（安全官：批量输入校验）。
+	accepted, skips := filterBatchItems(items)
+	if len(accepted) == 0 {
+		return 0, 0, skips, errors.New("没有可更新的容器（无关联容器或超出批量上限）")
+	}
+
+	// 2. 抢占批量队列：同一时刻只允许一个批次在跑，也不让单容器更新插队。
+	s.batchMu.Lock()
+	if s.batchActive {
+		s.batchMu.Unlock()
+		return 0, 0, skips, errors.New("有批量更新任务正在执行，请稍后再试")
+	}
+	s.batchActive = true
+	s.batchMu.Unlock()
+	clearActive := func() {
+		s.batchMu.Lock()
+		s.batchActive = false
+		s.batchMu.Unlock()
+	}
+
+	if s.up.Busy() {
+		clearActive()
+		return 0, 0, skips, errors.New("已有更新任务正在执行，请稍后重试")
+	}
+
+	// 3. 跳过已有进行中任务的容器。
+	runnable := make([]model.Notification, 0, len(accepted))
+	for _, it := range accepted {
+		if busy, err := s.st.HasRunningTask(it.ContainerID); err == nil && busy {
+			skips = append(skips, BatchSkip{ContainerName: it.ContainerName, Reason: "该容器已有进行中的更新任务"})
+			continue
+		}
+		runnable = append(runnable, it)
+	}
+	if len(runnable) == 0 {
+		clearActive()
+		return 0, 0, skips, errors.New("所选容器都已有进行中的更新任务")
+	}
+
+	batchItems := make([]model.BatchItem, 0, len(runnable))
+	for _, it := range runnable {
+		batchItems = append(batchItems, model.BatchItem{
+			NotificationID: it.ID,
+			ImageRef:       it.ImageRef,
+			ContainerID:    it.ContainerID,
+			ContainerName:  it.ContainerName,
+			Kind:           it.Kind,
+			LocalTag:       it.LocalTag,
+			LatestTag:      it.LatestTag,
+			LocalSummary:   it.LocalSummary,
+			RemoteSummary:  it.RemoteSummary,
+		})
+	}
+
+	batch := &model.UpdateBatch{
+		Status:      model.BatchRunning,
+		TriggeredBy: triggeredBy,
+		Total:       len(batchItems),
+		Items:       batchItems,
+	}
+	batchID, err := s.st.CreateBatch(batch)
+	if err != nil {
+		clearActive()
+		s.log.Error("创建批量更新批次失败", "err", err)
+		return 0, 0, skips, fmt.Errorf("创建批量更新批次失败: %w", err)
+	}
+
+	// 4. 一次性落全部任务，再由单个 worker 串行执行。
+	requests := make([]updater.Request, 0, len(batchItems))
+	taskIDs := make([]int64, 0, len(batchItems))
+	for _, it := range batchItems {
+		target := batchTargetRef(it)
+		task := &model.Task{
+			BatchID:        batchID,
+			NotificationID: it.NotificationID,
+			ImageRef:       target,
+			ContainerID:    it.ContainerID,
+			ContainerName:  it.ContainerName,
+			TriggeredBy:    triggeredBy,
+		}
+		taskID, cerr := s.st.CreateTask(task)
+		if cerr != nil {
+			s.log.Error("创建更新任务失败", "err", cerr)
+			continue
+		}
+		taskIDs = append(taskIDs, taskID)
+		if it.NotificationID > 0 {
+			if serr := s.st.SetNotificationCardState(it.NotificationID, model.CardUpdating); serr != nil {
+				s.log.Warn("更新通知状态失败", "err", serr)
+			}
+		}
+		requests = append(requests, updater.Request{
+			TaskID:        taskID,
+			ImageRef:      target,
+			ContainerID:   it.ContainerID,
+			ContainerName: it.ContainerName,
+			TriggeredBy:   triggeredBy,
+		})
+	}
+
+	if len(requests) == 0 {
+		clearActive()
+		_ = s.st.UpdateBatchProgress(batchID, model.BatchDone, 0, len(batchItems), 0, 0)
+		return batchID, 0, skips, nil
+	}
+
+	go s.runBatch(batchID, runnable, requests, triggeredBy, clearActive)
+	return batchID, len(requests), skips, nil
+}
+
+// filterBatchItems 对批量输入做过滤、去重与限量，返回可执行项与跳过项。
+//
+// 抽成纯函数是为了让「安全边界」可被单元测试直接钉死：
+//   - 没有关联本地容器的条目不能进批次；
+//   - 同一个容器只执行一次；
+//   - 单批最多 maxBatchItems 个。
+func filterBatchItems(items []model.Notification) ([]model.Notification, []BatchSkip) {
+	seen := map[string]bool{}
+	accepted := make([]model.Notification, 0, len(items))
+	skips := make([]BatchSkip, 0)
+	for _, it := range items {
+		if it.ContainerID == "" {
+			skips = append(skips, BatchSkip{ContainerName: it.ContainerName, Reason: "无关联本地容器"})
+			continue
+		}
+		if seen[it.ContainerID] {
+			continue
+		}
+		seen[it.ContainerID] = true
+		if len(accepted) >= maxBatchItems {
+			skips = append(skips, BatchSkip{ContainerName: it.ContainerName, Reason: "超出单次批量上限"})
+			continue
+		}
+		accepted = append(accepted, it)
+	}
+	return accepted, skips
+}
+
+// batchTargetRef 计算批量条目真正要拉取的镜像引用（复用 TargetRef 的语义）。
+func batchTargetRef(it model.BatchItem) string {
+	n := &model.Notification{
+		ImageRef:   it.ImageRef,
+		LatestTag:  it.LatestTag,
+		LocalTag:   it.LocalTag,
+	}
+	return TargetRef(n)
+}
+
+// runBatch 串行执行批次内的更新，逐条回写卡片，最后回写汇总卡/消息。
+func (s *Service) runBatch(batchID int64, items []model.Notification, requests []updater.Request, triggeredBy string, clearActive func()) {
+	defer clearActive()
+
+	ctx, cancel := context.WithTimeout(s.baseCtx, 45*time.Minute)
+	defer cancel()
+
+	s.log.Info("开始执行批量更新", "batch", batchID, "total", len(requests), "by", triggeredBy)
+
+	results := s.up.RunBatch(ctx, requests)
+
+	succeeded, failed, rolledBack := 0, 0, 0
+	for i, res := range results {
+		if i < len(items) && items[i].ID > 0 {
+			// 用库里的最新投递坐标回写卡片（期间用户可能又动过）。
+			if n, gerr := s.st.GetNotification(items[i].ID); gerr == nil {
+				s.finishUpdate(n, res.TaskID, res.Err)
+			}
+		}
+		if res.Err == nil {
+			succeeded++
+			continue
+		}
+		if t, terr := s.st.GetTask(res.TaskID); terr == nil && t.Status == model.TaskRolledBack {
+			rolledBack++
+		} else {
+			failed++
+		}
+	}
+
+	_ = s.st.UpdateBatchProgress(batchID, model.BatchDone, succeeded, failed, rolledBack, 0)
+
+	// 回写批量汇总卡/消息。
+	batch, err := s.st.GetBatch(batchID)
+	if err != nil || len(batch.Deliveries) == 0 {
+		return
+	}
+	summary := fmt.Sprintf("本次批量更新完成：成功 %d 个，失败 %d 个，自动回滚 %d 个。",
+		succeeded, failed, rolledBack)
+	s.editBatchDeliveries(batch, summary)
+}
+
+// editBatchDeliveries 把汇总卡/消息原地改成最终结果。
+func (s *Service) editBatchDeliveries(batch *model.UpdateBatch, summary string) {
+	pushCtx, cancelPush := context.WithTimeout(s.baseCtx, 30*time.Second)
+	defer cancelPush()
+	for _, d := range batch.Deliveries {
+		switch d.Channel {
+		case model.ChannelTelegram:
+			if !s.tg.Configured() {
+				continue
+			}
+			chatID := d.ChatRef
+			if chatID == "" {
+				chatID = s.tg.DefaultChatID()
+			}
+			msgID, err := strconv.ParseInt(d.MessageID, 10, 64)
+			if err != nil {
+				continue
+			}
+			if err := s.tg.EditMessageText(pushCtx, chatID, msgID, telegram.BuildBatchStateMessage(batch.Total, summary)); err != nil {
+				s.log.Warn("更新 Telegram 批量汇总消息失败", "batch", batch.ID, "err", err)
+			}
+		default:
+			if !s.fs.Configured() {
+				continue
+			}
+			if err := s.fs.PatchCard(pushCtx, d.MessageID, feishu.BuildBatchStateCard(batch.Total, summary)); err != nil {
+				s.log.Warn("更新飞书批量汇总卡片失败", "batch", batch.ID, "err", err)
+			}
+		}
 	}
 }
 

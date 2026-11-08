@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
+	"github.com/haihaipypy/autodocker/internal/model"
 )
 
 // 「未使用镜像」这格的口径：按镜像 ID 去重、只要还有容器引用就不算。
@@ -35,5 +36,61 @@ func TestCountUnusedImages(t *testing.T) {
 	// 没有镜像 → 0
 	if got := countUnusedImages(nil, used); got != 0 {
 		t.Errorf("空列表应为 0，实际 %d", got)
+	}
+}
+
+// GET 设置时凭据绝不能以明文回显：页面拿不到明文，
+// 局域网里任何能打开这个端口的人就偷不走 Token/密码。
+// 非敏感字段必须原样保留，不能让脱敏误伤表单里的其它输入。
+func TestMaskSecrets(t *testing.T) {
+	in := model.Settings{
+		FeishuAppID:      "cli_x",
+		FeishuAppSecret:  "feishu-secret",
+		FeishuChatID:     "oc_x",
+		TelegramBotToken: "123:abc",
+		TelegramChatID:   "-100123",
+		AdminUser:        "admin",
+		AdminPassword:    "p@ss",
+	}
+	maskSecrets(&in)
+
+	if in.FeishuAppSecret != secretMask {
+		t.Errorf("FeishuAppSecret 应被掩码，得到 %q", in.FeishuAppSecret)
+	}
+	if in.TelegramBotToken != secretMask {
+		t.Errorf("TelegramBotToken 应被掩码，得到 %q", in.TelegramBotToken)
+	}
+	if in.AdminPassword != secretMask {
+		t.Errorf("AdminPassword 应被掩码，得到 %q", in.AdminPassword)
+	}
+	// 非敏感字段不能动
+	if in.FeishuAppID != "cli_x" || in.FeishuChatID != "oc_x" ||
+		in.TelegramChatID != "-100123" || in.AdminUser != "admin" {
+		t.Errorf("脱敏不应改动非敏感字段: %+v", in)
+	}
+}
+
+// PUT 收到掩码时表示「没改，保留旧值」；收到真实值或空串时尊重用户输入。
+func TestKeepMaskedSecrets(t *testing.T) {
+	prev := model.Settings{
+		FeishuAppSecret:  "feishu-secret",
+		TelegramBotToken: "123:abc",
+		AdminPassword:    "p@ss",
+	}
+	in := model.Settings{
+		FeishuAppSecret:  secretMask,  // 未改动 → 还原旧值
+		TelegramBotToken: "new-token", // 用户改了 → 用新值
+		AdminPassword:    "",          // 用户清空 → 尊重空值（关闭登录）
+	}
+	keepMaskedSecrets(&in, prev)
+
+	if in.FeishuAppSecret != "feishu-secret" {
+		t.Errorf("掩码应还原为旧值，得到 %q", in.FeishuAppSecret)
+	}
+	if in.TelegramBotToken != "new-token" {
+		t.Errorf("用户新值不应被覆盖，得到 %q", in.TelegramBotToken)
+	}
+	if in.AdminPassword != "" {
+		t.Errorf("空串是「显式清空」而不是掩码，应保持为空，得到 %q", in.AdminPassword)
 	}
 }

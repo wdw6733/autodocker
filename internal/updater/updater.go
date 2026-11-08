@@ -97,6 +97,48 @@ func (u *Updater) Busy() bool {
 // Run 执行一次容器更新，阻塞至结束。
 // 返回非空 error 表示更新未成功（可能已回滚）。
 func (u *Updater) Run(ctx context.Context, req Request) error {
+	return u.runWithLock(ctx, req)
+}
+
+// BatchResult 批量更新里单个条目的执行结果。
+type BatchResult struct {
+	TaskID int64
+	Err    error
+}
+
+// RunBatch 串行执行一批容器更新，整个批次共用同一把单飞锁：
+// 批量进行期间不会有单容器更新插队，批次内各条目也不会互相踩踏。
+// 单个条目失败不影响后续条目 —— 每个条目的结果单独返回，由调用方汇总。
+func (u *Updater) RunBatch(ctx context.Context, reqs []Request) []BatchResult {
+	results := make([]BatchResult, 0, len(reqs))
+
+	u.mu.Lock()
+	if u.running {
+		u.mu.Unlock()
+		for _, req := range reqs {
+			err := errors.New("已有更新任务正在执行，请稍后重试")
+			_ = u.st.FinishTask(req.TaskID, model.TaskFailed, "", err.Error())
+			results = append(results, BatchResult{TaskID: req.TaskID, Err: err})
+		}
+		return results
+	}
+	u.running = true
+	opt := u.opt
+	u.mu.Unlock()
+	defer func() {
+		u.mu.Lock()
+		u.running = false
+		u.mu.Unlock()
+	}()
+
+	for _, req := range reqs {
+		results = append(results, BatchResult{TaskID: req.TaskID, Err: u.runOne(ctx, req, opt)})
+	}
+	return results
+}
+
+// runWithLock 抢到单飞锁后执行一次更新。
+func (u *Updater) runWithLock(ctx context.Context, req Request) error {
 	u.mu.Lock()
 	if u.running {
 		u.mu.Unlock()
@@ -112,7 +154,11 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 		u.running = false
 		u.mu.Unlock()
 	}()
+	return u.runOne(ctx, req, opt)
+}
 
+// runOne 更新流程本体：只使用快照好的 opt，不碰锁。
+func (u *Updater) runOne(ctx context.Context, req Request, opt Options) error {
 	logf := func(format string, args ...any) {
 		line := fmt.Sprintf(format, args...)
 		u.log.Info(line, "task_id", req.TaskID, "container", req.ContainerName)
