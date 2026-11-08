@@ -12,9 +12,12 @@ import (
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
+	"github.com/haihaipypy/autodocker/internal/notify/wecom"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
+	"github.com/haihaipypy/autodocker/internal/selfcheck"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
 )
@@ -752,6 +755,30 @@ func (s *Server) handleManualUpdate(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"task_id": taskID})
 }
 
+// handleSelfCheck 返回上一次自检的结果（缓存，不打网络）。
+func (s *Server) handleSelfCheck(w http.ResponseWriter, r *http.Request) {
+	if s.self == nil {
+		writeOK(w, map[string]any{"current": "dev"})
+		return
+	}
+	writeOK(w, s.self.State())
+}
+
+// handleSelfCheckRun 立刻查一次。
+//
+// 只在用户主动点「检查更新」时走到这里，所以请求本身要等网络 ——
+// 直连不通时要依次试几个公共加速，最坏 30 多秒，所以留 40 秒上限；
+// 超时就当这次没查到，不让页面一直转圈。
+func (s *Server) handleSelfCheckRun(w http.ResponseWriter, r *http.Request) {
+	if s.self == nil {
+		writeErr(w, http.StatusServiceUnavailable, "自检未启用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	writeOK(w, s.self.Check(ctx, true))
+}
+
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, s.LoadSettings())
 }
@@ -775,6 +802,10 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "健康检查等待时间需在 0-600 秒之间")
 		return
 	}
+	// 先把自检的两个连接参数规整好再落库：用户填 github.1day.vip 是常事，
+	// 存原样的话页面上永远显示半截，看不出到底生效没有。
+	in.SelfCheckMirror = selfcheck.NormalizeMirror(in.SelfCheckMirror)
+	in.SelfCheckProxy = strings.TrimSpace(in.SelfCheckProxy)
 	if err := s.saveSettings(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败: "+err.Error())
 		return
@@ -905,13 +936,107 @@ func (s *Server) handleTelegramStatus(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, resp)
 }
 
-type registryTestReq struct {
-	Reference string `json:"reference"`
+func (s *Server) handleDingTalkTest(w http.ResponseWriter, r *http.Request) {
+	if err := s.nt.SendTestDingTalk(r.Context()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"result": "sent"})
 }
 
-// handleRegistryTest 逐个探测注册表与各加速源的连通情况。
+// handleDingTalkCheck 只验「凭据对不对、这台机器能不能连上钉钉」。
 //
-// 镜像列表里全是「未知」时，用户只看到三个字，无从下手。
+// 与 Telegram 的检测同一个用意：「发送测试卡片」必须先有模板与会话才跑得起来，
+// 真正的病因（Client Secret 抄错、出网不通）会被挡在后面，
+// 报出来的却是「还缺卡片模板」—— 人就跑去折腾模板了。
+// 这里只跑一次 accessToken，把凭据与出网两件事一次说清。
+//
+// 请求体可以带覆盖值：刚改完还没保存时也能先试通，省掉「保存→回来看→再改」。
+func (s *Server) handleDingTalkCheck(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ClientID     string `json:"dingtalk_client_id"`
+		ClientSecret string `json:"dingtalk_client_secret"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&in)
+
+	cfg := s.nt.DingTalk().Config()
+	if in.ClientID != "" {
+		cfg.ClientID = in.ClientID
+	}
+	if in.ClientSecret != "" {
+		cfg.ClientSecret = in.ClientSecret
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	if err := dingtalk.New(cfg).Check(ctx); err != nil {
+		writeOK(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeOK(w, map[string]any{"ok": true, "apiBase": cfg.APIBase})
+}
+
+func (s *Server) handleDingTalkStatus(w http.ResponseWriter, r *http.Request) {
+	at, action, ch, count := s.nt.CallbackState()
+	dg := s.nt.DingTalk()
+	resp := map[string]any{
+		"configured":       dg.Configured(),
+		"stream":           s.nt.DingTalkStreamRunning(),
+		"conversation_id":  dg.ConversationID(),
+		"card_template_id": dg.CardTemplateID(),
+		// 缺哪几项单独列出来：设置页据此告诉用户「还差什么」，
+		// 而不是笼统地说一句「未配置」。
+		"missing":        dg.MissingForSend(),
+		"chats":          s.nt.DingTalkChats(),
+		"last_error":     s.nt.DingTalkLastError(),
+		"callback_count": count,
+		"last_action":    action,
+		"last_channel":   string(ch),
+	}
+	if !at.IsZero() {
+		resp["last_callback_at"] = at.Format(time.RFC3339)
+	}
+	writeOK(w, resp)
+}
+
+func (s *Server) handleWeComTest(w http.ResponseWriter, r *http.Request) {
+	if err := s.nt.SendTestWeCom(r.Context()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"result": "sent"})
+}
+
+// handleWeComStatus 长连接状态与会话列表。
+//
+// 企业微信没有独立的「检测连通性」接口：认证就是建立长连接本身，
+// 所以这个接口同时承担两件事 —— 告诉设置页连上没有，以及缺哪几项。
+func (s *Server) handleWeComStatus(w http.ResponseWriter, r *http.Request) {
+	at, action, ch, count := s.nt.CallbackState()
+	wc := s.nt.WeCom()
+
+	resp := map[string]any{
+		"configured":     wc.Configured(),
+		"ready":          wc.Ready(),
+		"running":        s.nt.WeComRunning(),
+		"chat_id":        wc.ChatID(),
+		"missing":        wc.MissingForSend(),
+		"chats":          s.nt.WeComChats(),
+		"last_error":     s.nt.WeComLastError(),
+		"last_action":    action,
+		"last_channel":   string(ch),
+		"callback_count": count,
+	}
+	if !at.IsZero() {
+		resp["last_callback_at"] = at.Format(time.RFC3339)
+	}
+	writeOK(w, resp)
+}
+
+type registryTestReq struct {
+	Reference string `json:"reference"`
+} // handleRegistryTest 逐个探测注册表与各加速源的连通情况。// 镜像列表里全是「未知」时，用户只看到三个字，无从下手。
 // 这个接口把「直连通不通、加速站通不通、tag 到底在不在」逐条摆出来，
 // 让排查从「猜」变成「看」。
 func (s *Server) handleRegistryTest(w http.ResponseWriter, r *http.Request) {
@@ -990,14 +1115,62 @@ func (s *Server) LoadSettings() model.Settings {
 		TelegramChatID:    s.cfg.TelegramChatID,
 		TelegramAPIBase:   s.cfg.TelegramAPIBase,
 		TelegramProxy:     s.cfg.TelegramProxy,
-		AdminUser:         authUser,
-		AdminPassword:     authPass,
+
+		DingTalkClientID:       s.cfg.DingTalkClientID,
+		DingTalkClientSecret:   s.cfg.DingTalkClientSecret,
+		DingTalkCardTemplateID: s.cfg.DingTalkCardTemplateID,
+		DingTalkConversationID: s.cfg.DingTalkConversationID,
+
+		WeComBotID:  s.cfg.WeComBotID,
+		WeComSecret: s.cfg.WeComSecret,
+		WeComChatID: s.cfg.WeComChatID,
+
+		AdminUser:     authUser,
+		AdminPassword: authPass,
+
+		// 默认开着：老库升级上来没有这个字段，unmarshal 不会覆盖它；
+		// 反过来若默认关闭，用户永远等不到第一次更新提示。
+		CheckUpdates: true,
+
+		// 代理与加速前缀默认留空 —— 留空就是直连，和这一版之前的行为一致。
+		// 国内机器连不上 GitHub 时由用户在设置页自己填，不预置任何第三方地址。
 	}
 	raw, ok, err := s.st.GetSetting(settingsKey)
 	if err == nil && ok && raw != "" {
 		_ = json.Unmarshal([]byte(raw), &out)
 	}
+
+	// 开关字段是后加的，老库里没有。缺失时按「凭据齐不齐」推导 ——
+	// 若一律当成关闭，用户升级到这一版会在毫无提示的情况下收不到任何提醒。
+	feOn := enabledOrDefault(out.FeishuEnabled, feishuReady(out))
+	tgOn := enabledOrDefault(out.TelegramEnabled, out.TelegramBotToken != "" && out.TelegramChatID != "")
+	dtOn := enabledOrDefault(out.DingTalkEnabled, dingtalkReady(out))
+	wcOn := enabledOrDefault(out.WeComEnabled, wecomReady(out))
+	out.FeishuEnabled, out.TelegramEnabled, out.DingTalkEnabled = &feOn, &tgOn, &dtOn
+	out.WeComEnabled = &wcOn
+
 	return out
+}
+
+// enabledOrDefault 开关没设置过时按「这个渠道配齐了没有」推导。
+func enabledOrDefault(v *bool, configured bool) bool {
+	if v != nil {
+		return *v
+	}
+	return configured
+}
+
+func feishuReady(s model.Settings) bool {
+	return s.FeishuAppID != "" && s.FeishuAppSecret != "" && s.FeishuChatID != ""
+}
+
+func dingtalkReady(s model.Settings) bool {
+	return s.DingTalkClientID != "" && s.DingTalkClientSecret != "" &&
+		s.DingTalkCardTemplateID != "" && s.DingTalkConversationID != ""
+}
+
+func wecomReady(s model.Settings) bool {
+	return s.WeComBotID != "" && s.WeComSecret != "" && s.WeComChatID != ""
 }
 
 func (s *Server) saveSettings(in model.Settings) error {
@@ -1041,6 +1214,14 @@ func (s *Server) ApplySettings(in model.Settings) {
 			Auth:     s.cfg.RegistryAuth,
 		})
 	}
+	// 自检怎么连 GitHub 也在这里下发：用户填完代理点保存，
+	// 下一次「检查更新」就该走代理，而不是等应用重启。
+	if s.self != nil {
+		s.self.Configure(selfcheck.Options{
+			Proxy:  in.SelfCheckProxy,
+			Mirror: in.SelfCheckMirror,
+		})
+	}
 	// 访问密码可以在页面里改：留空即关闭登录，保存后下一个请求就按新凭据校验。
 	s.setAuth(in.AdminUser, in.AdminPassword)
 	s.nt.ApplyChannel(in.NotifyChannel)
@@ -1051,4 +1232,23 @@ func (s *Server) ApplySettings(in model.Settings) {
 		APIBase: in.TelegramAPIBase,
 		Proxy:   in.TelegramProxy,
 	})
+	s.nt.ApplyDingTalk(dingtalk.Config{
+		ClientID:       in.DingTalkClientID,
+		ClientSecret:   in.DingTalkClientSecret,
+		CardTemplateID: in.DingTalkCardTemplateID,
+		ConversationID: in.DingTalkConversationID,
+	})
+	s.nt.ApplyWeCom(wecom.Config{
+		BotID:  in.WeComBotID,
+		Secret: in.WeComSecret,
+		ChatID: in.WeComChatID,
+	})
+	// 开关同样按「缺失就按凭据推导」处理：老客户端或脚本 PUT 时不会带这几个字段，
+	// 一律当 false 会把用户正在用的渠道全关掉，而且下次打开页面才看得出来。
+	s.nt.ApplyNotifyEnabled(
+		enabledOrDefault(in.FeishuEnabled, feishuReady(in)),
+		enabledOrDefault(in.TelegramEnabled, in.TelegramBotToken != "" && in.TelegramChatID != ""),
+		enabledOrDefault(in.DingTalkEnabled, dingtalkReady(in)),
+		enabledOrDefault(in.WeComEnabled, wecomReady(in)),
+	)
 }

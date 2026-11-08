@@ -10,20 +10,25 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/feishu"
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
+	"github.com/haihaipypy/autodocker/internal/notify/wecom"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
+	"github.com/haihaipypy/autodocker/internal/version"
 )
 
 // 与渠道无关的动作标识。
@@ -36,6 +41,18 @@ const (
 	ActionSnooze = "snooze"
 	ActionTest   = "test"
 )
+
+// settingDingTalkChats 钉钉会话列表在 settings 表里的 key。
+//
+// 就存 settings 里：几条 {id,title,last_at}，量小到不值得单开一张表，
+// 也就省掉了加表 / ALTER COLUMN 那套迁移 —— 那套在本项目里已经坑过一次。
+const settingDingTalkChats = "dingtalk_chats"
+
+// settingWeComChats 企业微信会话列表在 settings 表里的 key。
+//
+// 与钉钉同一个理由：企业微信没有「列出机器人所在群」的接口，
+// 这份列表只能靠收消息攒出来，丢了就得让用户再 @ 一次机器人。
+const settingWeComChats = "wecom_chats"
 
 // TargetRef 计算本次更新真正要拉取的镜像引用。
 //
@@ -57,12 +74,47 @@ func TargetRef(n *model.Notification) string {
 	return ref.WithTag(n.LatestTag)
 }
 
+// updateTarget 这一次更新实际要去的引用。
+//
+// 不能只信通知里记的 tag。通知可能是几天前「同一个 tag 内容变了」那版发出去的，
+// 当时仓库里还没有更高的版本；等用户翻出来点，监控项里早记着 v3.7.0 了。
+// 照旧通知的 v3.6.0 去重建，等于白拉一遍旧镜像 —— 耗时几十秒、卡片显示成功，
+// 页面上的「可更新 v3.7.0」却一步没动。
+//
+// 有更高版本 tag 时一律以它为准，与网页上那个「更新」按钮的口径一致。
+func (s *Service) updateTarget(n *model.Notification) string {
+	target := TargetRef(n)
+	img, err := s.monitorFor(n)
+	if err != nil || img.LatestTag == "" {
+		return target
+	}
+	ref, perr := registry.ParseReference(n.ImageRef)
+	if perr != nil || version.Compare(img.LatestTag, ref.Tag) <= 0 {
+		return target
+	}
+	return ref.WithTag(img.LatestTag)
+}
+
+// monitorFor 找到通知对应的监控项。
+//
+// 先按容器号找：升过 tag 之后这一行的 reference 还是旧的，
+// 拿通知里的引用去精确匹配会扑空。
+func (s *Service) monitorFor(n *model.Notification) (*model.Image, error) {
+	if img, err := s.st.FindImageByContainer(n.ContainerID); err == nil {
+		return img, nil
+	}
+	return s.st.FindImage(n.ImageRef, n.ContainerID)
+}
+
 // Service 通知与交互服务。
 type Service struct {
 	fs  *feishu.Client
 	lc  *feishu.LongConnManager
 	tg  *telegram.Client
 	tp  *telegram.PollManager
+	dg  *dingtalk.Client
+	ds  *dingtalk.StreamManager
+	wc  *wecom.Manager
 	st  *store.Store
 	up  *updater.Updater
 	log *slog.Logger
@@ -72,6 +124,11 @@ type Service struct {
 	// 设置里选的渠道（可能为空 = 未指定）。真正发消息时还要看这个渠道配没配。
 	chMu    sync.RWMutex
 	channel model.Channel
+
+	// 每个渠道的总开关。关掉只停「推新提醒」，已发出的卡片照样回写状态 ——
+	// 否则用户中途关掉渠道，之前那条消息会永远停在「待更新」。
+	enMu    sync.RWMutex
+	enabled map[model.Channel]bool
 
 	// 按钮回调的观测记录。发消息与收按钮回调是两条彼此独立的链路：
 	// 消息能收到并不代表按钮点得动。把最近一次回调记下来，
@@ -88,14 +145,32 @@ func New(ctx context.Context, fs *feishu.Client, st *store.Store, up *updater.Up
 	svc := &Service{
 		fs:      fs,
 		tg:      telegram.New(telegram.Config{}),
+		dg:      dingtalk.New(dingtalk.Config{}),
 		st:      st,
 		up:      up,
 		log:     logger,
 		baseCtx: ctx,
+		// 构造时先全开：ApplySettings 要等设置读出来才下发，
+		// 这中间若恰好跑完一轮扫描，按「默认关闭」处理会平白吞掉一条提醒。
+		// 用户真正关掉的开关会在 ApplySettings 里立刻覆盖掉这三个默认值。
+		enabled: map[model.Channel]bool{
+			model.ChannelFeishu:   true,
+			model.ChannelTelegram: true,
+			model.ChannelDingTalk: true,
+			model.ChannelWeCom:    true,
+		},
 	}
-	// Service 自己就是按钮回调的处理方，直接把 this 交给两个渠道的连接管理器
+	// Service 自己就是按钮回调的处理方，直接把 this 交给各渠道的连接管理器
 	svc.lc = feishu.NewLongConnManager(ctx, svc, logger)
 	svc.tp = telegram.NewPollManager(ctx, svc, logger)
+	svc.ds = dingtalk.NewStreamManager(ctx, svc, logger)
+	// 会话列表必须落盘：钉钉没有任何接口能反查「这个应用在哪些群里」，
+	// 这份列表是收消息时攒出来的，丢了就只能让用户再 @ 一次机器人。
+	svc.ds.AttachChatStore(dingtalkChatStore{st: st, log: logger})
+
+	// 企业微信同理：唯一能拿到 chatid 的时机就是机器人在群里收到消息。
+	svc.wc = wecom.New(ctx, svc, logger)
+	svc.wc.AttachChatStore(wecomChatStore{st: st, log: logger})
 	return svc
 }
 
@@ -104,6 +179,33 @@ func (s *Service) Feishu() *feishu.Client { return s.fs }
 
 // Telegram 暴露底层 Telegram 客户端。
 func (s *Service) Telegram() *telegram.Client { return s.tg }
+
+// DingTalk 暴露底层钉钉客户端。
+func (s *Service) DingTalk() *dingtalk.Client { return s.dg }
+
+// WeCom 暴露底层企业微信管理器，供 API 层做配置、测试与会话读取。
+func (s *Service) WeCom() *wecom.Manager { return s.wc }
+
+// ApplyNotifyEnabled 下发四个渠道的开关状态。
+//
+// 关掉只影响「要不要推新提醒」，不断开回调链路 ——
+// 断了的话，用户重新打开之前发出去的那批卡片就再也改不动状态了。
+func (s *Service) ApplyNotifyEnabled(feishu, telegramCh, dingtalkCh, wecomCh bool) {
+	s.enMu.Lock()
+	s.enabled[model.ChannelFeishu] = feishu
+	s.enabled[model.ChannelTelegram] = telegramCh
+	s.enabled[model.ChannelDingTalk] = dingtalkCh
+	s.enabled[model.ChannelWeCom] = wecomCh
+	s.enMu.Unlock()
+}
+
+// channelEnabled 渠道开关是否打开。没下发过一律按关闭处理：
+// 宁可少发一条，也不要在一个用户明确没说「要」的渠道上发消息。
+func (s *Service) channelEnabled(ch model.Channel) bool {
+	s.enMu.RLock()
+	defer s.enMu.RUnlock()
+	return s.enabled[ch]
+}
 
 // ApplyChannel 记录用户选的渠道。留空表示「谁配好了就用谁」，飞书优先。
 func (s *Service) ApplyChannel(ch string) {
@@ -171,6 +273,119 @@ func (s *Service) ApplyTelegram(cfg telegram.Config) {
 	s.tp.Ensure(cfg)
 }
 
+// ApplyDingTalk 应用一份钉钉配置。
+//
+// 只有应用凭据就会拉起 Stream 长连接（会话与模板可以后补）：
+// 会话 ID 只能靠「机器人在群里收到一条消息」带上来，
+// 而收消息的前提就是长连接已经在线 —— 等填完会话再连，就永远等不到。
+func (s *Service) ApplyDingTalk(cfg dingtalk.Config) {
+	s.dg.SetOptions(cfg)
+	s.ds.Ensure(cfg)
+}
+
+// DingTalkChats 机器人在钉钉上最近收到过消息的会话。
+func (s *Service) DingTalkChats() []dingtalk.ChatInfo { return s.ds.Chats() }
+
+// dingtalkChatStore 把钉钉会话列表存进 settings 表。
+//
+// 存 JSON 而不是单开一张表：一条记录就 {id,title,last_at} 三个字段，
+// 加表还要走 ALTER COLUMN 那套迁移，代价远大于收益。
+type dingtalkChatStore struct {
+	st  *store.Store
+	log *slog.Logger
+}
+
+func (d dingtalkChatStore) LoadChats() []dingtalk.ChatInfo {
+	if d.st == nil {
+		return nil
+	}
+	raw, ok, err := d.st.GetSetting(settingDingTalkChats)
+	if err != nil || !ok || raw == "" {
+		return nil
+	}
+	var out []dingtalk.ChatInfo
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		// 存坏了就当没有：这份数据随时能靠再 @ 一次机器人重建，
+		// 不值得为它打断启动。
+		return nil
+	}
+	return out
+}
+
+func (d dingtalkChatStore) SaveChats(chats []dingtalk.ChatInfo) {
+	if d.st == nil {
+		return
+	}
+	b, err := json.Marshal(chats)
+	if err == nil {
+		err = d.st.SetSetting(settingDingTalkChats, string(b))
+	}
+	// 写失败只影响「重启后还在不在」，本次运行内存里那份照样能选，
+	// 所以只记一条日志，不往上抛。
+	if err != nil && d.log != nil {
+		d.log.Warn("保存钉钉会话列表失败", "err", err)
+	}
+}
+
+// DingTalkLastError 最近一次 Stream 建连失败的原因。
+func (s *Service) DingTalkLastError() string { return s.ds.LastError() }
+
+// DingTalkStreamRunning Stream 长连接的 goroutine 是否在跑。
+func (s *Service) DingTalkStreamRunning() bool { return s.ds.Running() }
+
+// ApplyWeCom 应用一份企业微信配置并让长连接收敛。
+//
+// 只要 BotID + Secret 就会拉起长连接（会话可以后补）：
+// chatid 只能靠「机器人在群里收到一条消息」带上来，而收消息的前提
+// 就是长连接已经在线 —— 等填完会话再连，就永远等不到。
+func (s *Service) ApplyWeCom(cfg wecom.Config) {
+	s.wc.Ensure(cfg)
+}
+
+// WeComChats 机器人在企业微信上最近收到过消息的会话。
+func (s *Service) WeComChats() []wecom.ChatInfo { return s.wc.Chats() }
+
+// WeComLastError 最近一次长连接失败的原因。
+func (s *Service) WeComLastError() string { return s.wc.LastError() }
+
+// WeComRunning 长连接的 goroutine 是否在跑。
+func (s *Service) WeComRunning() bool { return s.wc.Running() }
+
+// wecomChatStore 把企业微信会话列表存进 settings 表（同钉钉的做法）。
+type wecomChatStore struct {
+	st  *store.Store
+	log *slog.Logger
+}
+
+func (w wecomChatStore) LoadChats() []wecom.ChatInfo {
+	if w.st == nil {
+		return nil
+	}
+	raw, ok, err := w.st.GetSetting(settingWeComChats)
+	if err != nil || !ok || raw == "" {
+		return nil
+	}
+	var out []wecom.ChatInfo
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		// 存坏了就当没有：再 @ 一次机器人就能重建，不值得为它打断启动。
+		return nil
+	}
+	return out
+}
+
+func (w wecomChatStore) SaveChats(chats []wecom.ChatInfo) {
+	if w.st == nil {
+		return
+	}
+	b, err := json.Marshal(chats)
+	if err == nil {
+		err = w.st.SetSetting(settingWeComChats, string(b))
+	}
+	if err != nil && w.log != nil {
+		w.log.Warn("保存企业微信会话列表失败", "err", err)
+	}
+}
+
 // LongConnRunning 返回飞书卡片回调长连接是否已就绪。
 func (s *Service) LongConnRunning() bool { return s.lc.Running() }
 
@@ -179,23 +394,27 @@ func (s *Service) TelegramPolling() bool { return s.tp.Running() }
 
 // ChannelStatus 单个通知渠道的可用状态，供顶栏胶囊展示。
 //
-// Configured 说的是「写得出去」：凭据与 chat_id 都填了；
+// Configured 说的是「写得出去」：凭据与接收会话都填了；
 // Online 说的是「链路真的通」—— 不能只看轮询/长连接有没有拉起，
 // 那只是 goroutine 活着，token 写错、代理不通时它照样是 true，
 // 界面就会长成一副岁月静好的样子。
 //
-// 两个渠道可能同时配好，所以这里返回列表而不是单个值：
+// Enabled 是用户的总开关。它和「连不上」是两件事：
+// 用户主动关掉时说「未连接」会让人以为坏了，所以顶栏单独说「已暂停」。
+//
+// 三个渠道可能同时配好，所以这里返回列表而不是单个值：
 // 顶栏只说「已连接」，具体是哪几个挂 title 上。
 type ChannelStatus struct {
 	Name       string `json:"name"`
 	Configured bool   `json:"configured"`
+	Enabled    bool   `json:"enabled"`
 	Online     bool   `json:"online"`
 	Error      string `json:"error,omitempty"`
 }
 
 // ChannelStatuses 列出所有填过凭据的渠道及其链路状态。
 func (s *Service) ChannelStatuses() []ChannelStatus {
-	out := make([]ChannelStatus, 0, 2)
+	out := make([]ChannelStatus, 0, 4)
 
 	if s.fs.Configured() {
 		// 飞书的 SDK 自己带重连，没有可读的错误状态，只能看长连接在不在。
@@ -203,6 +422,7 @@ func (s *Service) ChannelStatuses() []ChannelStatus {
 		out = append(out, ChannelStatus{
 			Name:       "飞书",
 			Configured: ready,
+			Enabled:    s.channelEnabled(model.ChannelFeishu),
 			Online:     ready && s.lc.Running(),
 		})
 	}
@@ -212,8 +432,44 @@ func (s *Service) ChannelStatuses() []ChannelStatus {
 		out = append(out, ChannelStatus{
 			Name:       "Telegram",
 			Configured: ready,
+			Enabled:    s.channelEnabled(model.ChannelTelegram),
 			Online:     ready && s.tp.Running() && errText == "",
 			Error:      errText,
+		})
+	}
+	if s.dg.Configured() {
+		errText := s.ds.LastError()
+		// 钉钉更啰嗦一层：凭据齐只说明长连接能拉起，
+		// 真要发得出卡片还得有模板和会话，缺一样都算「没配好」。
+		missing := s.dg.MissingForSend()
+		ready := len(missing) == 0
+		errOut := errText
+		if errOut == "" && !ready {
+			errOut = "还缺 " + strings.Join(missing, "、")
+		}
+		out = append(out, ChannelStatus{
+			Name:       "钉钉",
+			Configured: ready,
+			Enabled:    s.channelEnabled(model.ChannelDingTalk),
+			Online:     ready && s.ds.Running() && errText == "",
+			Error:      errOut,
+		})
+	}
+	if s.wc.Configured() {
+		errText := s.wc.LastError()
+		// 与钉钉同理：凭据齐只说明长连接拉得起，发得出消息还得有接收会话。
+		missing := s.wc.MissingForSend()
+		ready := len(missing) == 0
+		errOut := errText
+		if errOut == "" && !ready {
+			errOut = "还缺 " + strings.Join(missing, "、")
+		}
+		out = append(out, ChannelStatus{
+			Name:       "企业微信",
+			Configured: ready,
+			Enabled:    s.channelEnabled(model.ChannelWeCom),
+			Online:     ready && s.wc.Running() && errText == "",
+			Error:      errOut,
 		})
 	}
 	return out
@@ -225,10 +481,12 @@ func (s *Service) TelegramChats() []telegram.ChatInfo { return s.tp.Chats() }
 // TelegramLastError 最近一次长轮询失败的原因。
 func (s *Service) TelegramLastError() string { return s.tp.LastError() }
 
-// Close 关闭两条按钮回调链路，用于进程退出前的收尾。
+// Close 关闭各条按钮回调链路，用于进程退出前的收尾。
 func (s *Service) Close() {
 	s.lc.Stop()
 	s.tp.Stop()
+	s.ds.Stop()
+	s.wc.Stop()
 }
 
 // recordCallback 记下一次按钮回调，返回其时间戳。
@@ -249,17 +507,26 @@ func (s *Service) CallbackState() (at time.Time, action string, ch model.Channel
 	return s.cbAt, s.cbAction, s.cbChan, s.cbCount
 }
 
-// readyChannels 返回「凭据填了、接收会话也有」的渠道，按飞书优先。
+// readyChannels 返回「开关开着、凭据填了、接收会话也有」的渠道，按飞书→Telegram→钉钉。
 //
 // 判 chat_id 而不是只看 Configured：应用凭据填完长连接就绿了，
 // 看着像配好了，实际一条消息也发不到任何地方。
+// 再叠一层开关判断：用户主动关掉的渠道不该再推新提醒。
 func (s *Service) readyChannels() []model.Channel {
-	out := make([]model.Channel, 0, 2)
-	if s.fs.Configured() && s.fs.DefaultChatID() != "" {
+	out := make([]model.Channel, 0, 4)
+	if s.channelEnabled(model.ChannelFeishu) && s.fs.Configured() && s.fs.DefaultChatID() != "" {
 		out = append(out, model.ChannelFeishu)
 	}
-	if s.tg.Configured() && s.tg.DefaultChatID() != "" {
+	if s.channelEnabled(model.ChannelTelegram) && s.tg.Configured() && s.tg.DefaultChatID() != "" {
 		out = append(out, model.ChannelTelegram)
+	}
+	if s.channelEnabled(model.ChannelDingTalk) && s.dg.Ready() {
+		out = append(out, model.ChannelDingTalk)
+	}
+	if s.channelEnabled(model.ChannelWeCom) && s.wc.Ready() && s.wc.Running() {
+		// 企业微信多一道「长连接必须在线」：它没有 HTTP 发送接口，
+		// 连接断了就一条也发不出去 —— 放着不管只会在每个渠道上刷一条发送失败。
+		out = append(out, model.ChannelWeCom)
 	}
 	return out
 }
@@ -298,6 +565,23 @@ func (s *Service) Notify(ctx context.Context, n *model.Notification) (string, er
 			})
 			s.log.Info("已推送更新提醒", "channel", "telegram", "ref", n.ImageRef, "message_id", msgID)
 
+		case model.ChannelDingTalk:
+			conv := s.dg.ConversationID()
+			outTrack := outTrackID(n.ID)
+			if err := s.dg.CreateAndDeliverCard(ctx, outTrack, dingtalk.BuildUpdateParams(n)); err != nil {
+				failures = append(failures, "钉钉："+err.Error())
+				s.log.Warn("钉钉推送失败", "ref", n.ImageRef, "err", err)
+				continue
+			}
+			// 钉钉的「消息坐标」就是 outTrackId：更新卡片、定位按钮回调都靠它，
+			// 不像飞书/Telegram 那样另有一个 message_id。
+			deliveries = append(deliveries, model.Delivery{
+				Channel:   model.ChannelDingTalk,
+				ChatRef:   conv,
+				MessageID: outTrack,
+			})
+			s.log.Info("已推送更新提醒", "channel", "dingtalk", "ref", n.ImageRef, "out_track_id", outTrack)
+
 		case model.ChannelFeishu:
 			chatID := s.fs.DefaultChatID()
 			msgID, err := s.fs.SendCard(ctx, "", feishu.BuildUpdateCard(n))
@@ -312,6 +596,23 @@ func (s *Service) Notify(ctx context.Context, n *model.Notification) (string, er
 				MessageID: msgID,
 			})
 			s.log.Info("已推送更新提醒", "channel", "feishu", "ref", n.ImageRef, "message_id", msgID)
+
+		case model.ChannelWeCom:
+			taskID := outTrackID(n.ID)
+			card := wecom.BuildUpdateCard(n, taskID)
+			if err := s.wc.SendTemplateCard(ctx, card); err != nil {
+				failures = append(failures, "企业微信："+err.Error())
+				s.log.Warn("企业微信推送失败", "ref", n.ImageRef, "err", err)
+				continue
+			}
+			// 企业微信的「消息坐标」就是 task_id：按钮回调里带的是它，
+			// 没有别的字段能把一条回调对回某条通知。
+			deliveries = append(deliveries, model.Delivery{
+				Channel:   model.ChannelWeCom,
+				ChatRef:   s.wc.ChatID(),
+				MessageID: taskID,
+			})
+			s.log.Info("已推送更新提醒", "channel", "wecom", "ref", n.ImageRef, "task_id", taskID)
 		}
 	}
 
@@ -431,6 +732,260 @@ func (s *Service) fixTelegramChatRef(n *model.Notification, chatID string) {
 	}
 }
 
+// ---- 钉钉 ----
+
+// outTrackSeq 卡片 ID 的进程内自增序号。
+//
+// 单靠纳秒时间戳不够：Windows 上 time.Now() 的精度只有百纳秒量级，
+// 两次相邻调用拿到同一个值很常见。而钉钉按 outTrackId 唯一标识一张卡，
+// 撞了第二张就投放不进去，报 cardAlreadyExist —— 现象是「发了两条通知，只收到一张卡」。
+var outTrackSeq atomic.Uint64
+
+// outTrackID 生成卡片实例 ID。
+//
+// 里面塞了通知 ID：钉钉的按钮回传参数由卡片模板定义，没有地方能像飞书那样
+// 把 nid 一起塞进按钮 value 里，所以只能靠卡片 ID 反查是哪条通知。
+func outTrackID(nid int64) string {
+	return fmt.Sprintf("ad-%d-%d-%d", nid, time.Now().UnixNano(), outTrackSeq.Add(1))
+}
+
+// outTrackIsTest 判断这张卡片是不是「发送测试」发的。
+//
+// 测试卡片用的是 nid=0，所以 ID 形如 ad-0-<纳秒>-<序号>。
+// 前缀比对就够了：真正的通知 nid 恒大于 0（见 parseOutTrackID 的校验）。
+func outTrackIsTest(s string) bool {
+	return strings.HasPrefix(s, "ad-0-")
+}
+
+// parseOutTrackID 从卡片 ID 里取回通知 ID，格式不对返回 0。
+func parseOutTrackID(s string) int64 {
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 || parts[0] != "ad" {
+		return 0
+	}
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
+
+// HandleDingTalkCard 实现 dingtalk.Handler：处理钉钉卡片按钮点击。
+//
+// 返回值随 ACK 立刻写回卡片 —— 钉钉那边按钮点下去，卡片变不变样全看这个。
+// 事后再异步调一次更新接口是给群里其他人看的（官方明说 ACK 里的
+// cardData 只下发给触发这次点击的那个人）。
+func (s *Service) HandleDingTalkCard(outTrack, action string) map[string]string {
+	at := s.recordCallback(model.ChannelDingTalk, action)
+
+	// 测试卡片不关联任何通知，必须在查库之前处理（它没有对应的通知记录）。
+	//
+	// 它的卡片 ID 是 ad-0-…，模板里那三个业务按钮点哪个都会走到这里：
+	// 用户不会去分辨「该点哪个」，任何一下点击都应该算把按钮链路验通了。
+	// 只认 action=="test" 的话，用户点「立即更新」会毫无反应，看着像链路坏了。
+	if action == ActionTest || outTrackIsTest(outTrack) {
+		s.log.Info("收到钉钉测试卡片回调，按钮链路正常", "action", action)
+		done := dingtalk.BuildTestDoneParams(at.Format("2006-01-02 15:04:05"))
+		s.updateDingTalkCardAsync(outTrack, done)
+		return done
+	}
+
+	nid := parseOutTrackID(outTrack)
+	if nid <= 0 {
+		s.log.Warn("钉钉卡片回调里没有可识别的通知 ID", "out_track_id", outTrack)
+		return nil
+	}
+	n, err := s.st.GetNotification(nid)
+	if err != nil {
+		// 查不到也要说一声：这条分支以前是静默的，用户点完没反应、
+		// 日志里又什么都没有，只能靠猜。
+		s.log.Warn("钉钉卡片回调指向的通知不存在", "nid", nid, "out_track_id", outTrack, "err", err)
+		return nil
+	}
+	// 核对这张卡片确实是这条通知发出去的。
+	// outTrackId 的格式是可推导的，不校验就等于「任何人构造一个 ID 就能
+	// 让任意一条历史通知触发容器重建」—— 重建容器等同于系统最高权限。
+	if !s.hasDingTalkDelivery(n, outTrack) {
+		s.log.Warn("钉钉卡片回调与投递记录不匹配，已忽略", "nid", nid, "out_track_id", outTrack)
+		return nil
+	}
+
+	out := s.applyAction(n, action, model.ChannelDingTalk)
+	if out.State == "" {
+		// 「更新已在进行中」「未知操作」两种情况：状态没变，也就没有新卡片数据可回。
+		// 但必须留一行，否则现象和「回调根本没进来」一模一样。
+		s.log.Warn("钉钉卡片回调未改变任何状态",
+			"nid", nid, "action", action, "card_state", n.CardState, "toast", out.Toast)
+		return nil
+	}
+	params := dingtalk.BuildStateParams(n, out.State, out.Detail)
+	s.updateDingTalkCardAsync(outTrack, params)
+	return params
+}
+
+// hasDingTalkDelivery 这条通知是否真的投递到了指定卡片实例。
+func (s *Service) hasDingTalkDelivery(n *model.Notification, outTrack string) bool {
+	for _, d := range n.Deliveries {
+		if d.Channel == model.ChannelDingTalk && d.MessageID == outTrack {
+			return true
+		}
+	}
+	// 老数据没有 deliveries 时退回主投递那一份
+	return len(n.Deliveries) == 0 &&
+		n.Channel == model.ChannelDingTalk && n.MessageID == outTrack
+}
+
+// updateDingTalkCardAsync 异步改写钉钉卡片。
+//
+// 同步做会拖长 ACK 时间：UpdateCard 前面可能还有一次 accessToken 请求，
+// 两跳加起来足够超时，表现为「点了按钮，卡片一直没变化」。
+func (s *Service) updateDingTalkCardAsync(outTrack string, params dingtalk.CardParams) {
+	if outTrack == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(s.baseCtx, 20*time.Second)
+		defer cancel()
+		if err := s.dg.UpdateCard(ctx, outTrack, params); err != nil {
+			s.log.Warn("更新钉钉卡片失败", "out_track_id", outTrack, "err", err)
+		}
+	}()
+}
+
+// HandleBotMessage 实现 dingtalk.Handler：机器人在某个会话里收到了消息。
+//
+// 故意不回任何内容。这条消息的唯一作用是让钉钉把 conversationId 带上来，
+// 用户不必去后台手抄一串 cid 开头的 ID；回一句「收到」只会在群里刷屏。
+func (s *Service) HandleDingTalkMessage(conversationID, title string) {
+	s.log.Info("钉钉机器人收到消息，已记录会话", "conversation_id", conversationID, "title", title)
+}
+
+// SendTestDingTalk 投放一张带按钮的测试卡片。
+//
+// 与飞书同一个道理：卡片发得出去，不代表按钮点得动 ——
+// 发卡片走服务端 API，按钮点击走 Stream 长连接，是两条独立链路。
+func (s *Service) SendTestDingTalk(ctx context.Context) error {
+	if !s.dg.Configured() {
+		return errors.New("钉钉应用 Client ID / Client Secret 未配置")
+	}
+	if miss := s.dg.MissingForSend(); len(miss) > 0 {
+		return errors.New("还缺 " + strings.Join(miss, "、") + "，请先补齐再测试")
+	}
+	return s.dg.CreateAndDeliverCard(ctx, outTrackID(0), dingtalk.BuildTestParams(s.dg.ConversationID()))
+}
+
+// ---- 企业微信 ----
+
+// HandleWeComCard 实现 wecom.Handler：处理模板卡片按钮点击。
+//
+// 返回值会被立刻写回卡片 —— 企业微信只给 5 秒，且只能用这次事件的 req_id。
+// 超过 5 秒的回写会被服务端丢弃，用户看到的就只是「点了没反应」。
+func (s *Service) HandleWeComCard(ev wecom.CardEvent) *wecom.TemplateCard {
+	at := s.recordCallback(model.ChannelWeCom, ev.Action)
+
+	// 「知道了」只是把按钮点掉。状态卡片不带业务按钮，但卡片类型要求至少一个，
+	// 于是有了这个按钮 —— 点它不该改任何状态，也不回写卡片（回了也是同一张）。
+	if ev.Action == wecom.ActionAck {
+		return nil
+	}
+
+	// 通知 ID 有两条来源。task_id 是官方的正规途径，但主动推送（aibot_send_msg）
+	// 的卡片被点击时它实测为空；按钮 key 里另带了一份，用作兜底。
+	nid := parseOutTrackID(ev.TaskID)
+	if nid <= 0 && ev.NotifID > 0 {
+		nid = ev.NotifID
+	}
+
+	// 测试卡片不关联任何通知，必须在查库之前处理。
+	// 它有两个特征：task_id 形如 ad-0-…，或按钮 key 里的通知 ID 明确写着 0。
+	// 三个业务按钮点哪个都算把链路验通了。
+	if outTrackIsTest(ev.TaskID) || (ev.NotifID == 0 && ev.Action != "") {
+		s.log.Info("收到企业微信测试卡片回调，按钮链路正常", "action", ev.Action)
+		card := wecom.BuildTestDoneCard(ev.TaskID, at.Format("2006-01-02 15:04:05"))
+		return &card
+	}
+
+	if nid <= 0 {
+		s.log.Warn("企业微信卡片回调里没有可识别的通知 ID",
+			"task_id", ev.TaskID, "event_key", ev.EventKey)
+		return nil
+	}
+	n, err := s.st.GetNotification(nid)
+	if err != nil {
+		s.log.Warn("企业微信卡片回调指向的通知不存在", "nid", nid, "task_id", ev.TaskID, "err", err)
+		return nil
+	}
+	// 核对这张卡片确实是这条通知发出去的：task_id 的格式是可推导的，
+	// 不校验就等于「任何人构造一个 ID 就能触发任意一条历史通知重建容器」。
+	if !s.hasWeComDelivery(n, ev.TaskID) {
+		s.log.Warn("企业微信卡片回调与投递记录不匹配，已忽略", "nid", nid, "task_id", ev.TaskID)
+		return nil
+	}
+
+	out := s.applyAction(n, ev.Action, model.ChannelWeCom)
+	if out.State == "" {
+		// 「更新已在进行中」「未知操作」：状态没变，也就没有新卡片可回。
+		// 但必须留一行日志，否则现象和「回调根本没进来」一模一样。
+		s.log.Warn("企业微信卡片回调未改变任何状态",
+			"nid", nid, "action", ev.Action, "event_key", ev.EventKey,
+			"card_state", n.CardState, "toast", out.Toast)
+		return nil
+	}
+	card := wecom.BuildStateCard(n, ev.TaskID, out.State, out.Detail)
+	return &card
+}
+
+// HandleWeComSession 实现 wecom.Handler：机器人在某个会话里收到了消息。
+//
+// 故意不回任何内容：这条消息的唯一作用是让企业微信把 chatid 带上来，
+// 用户不必去后台手抄一串 ID。回一句「收到」只会在群里刷屏。
+func (s *Service) HandleWeComSession(chatID, chatType, userID string) {
+	s.log.Info("企业微信机器人收到消息，已记录会话",
+		"chat_id", chatID, "chat_type", chatType, "user_id", userID)
+}
+
+// hasWeComDelivery 这条通知是否真的投递到了企业微信。
+//
+// taskID 非空时必须逐条对上：卡片 ID 的格式是可推导的，不校验就等于
+// 「构造一个 ID 就能触发任意一条历史通知重建容器」。
+//
+// taskID 为空时（主动推送的卡片被点击时实测如此）退回「这条通知投递过企业微信」：
+// 此时唯一的凭据是按钮 key 里的通知 ID，而 key 同样由本程序生成，不是外部可猜的输入。
+func (s *Service) hasWeComDelivery(n *model.Notification, taskID string) bool {
+	for _, d := range n.Deliveries {
+		if d.Channel != model.ChannelWeCom {
+			continue
+		}
+		if taskID == "" || d.MessageID == taskID {
+			return true
+		}
+	}
+	return len(n.Deliveries) == 0 && n.Channel == model.ChannelWeCom &&
+		(taskID == "" || n.MessageID == taskID)
+}
+
+// SendTestWeCom 推一张带按钮的测试卡片。
+//
+// 与飞书 / 钉钉同一个道理：卡片发得出去不代表按钮点得动 ——
+// 发卡片走 aibot_send_msg，按钮点击走 aibot_event_callback，两条独立链路。
+func (s *Service) SendTestWeCom(ctx context.Context) error {
+	if !s.wc.Configured() {
+		return errors.New("企业微信 BotID / Secret 未配置")
+	}
+	// 先看连接：企业微信所有发送都要经过长连接，没连上时 SendTemplateCard
+	// 只会回一句「长连接未建立」，用户不知道该等一等还是去查凭据。
+	if !s.wc.Running() {
+		if msg := s.wc.LastError(); msg != "" {
+			return fmt.Errorf("长连接未建立：%s", msg)
+		}
+		return errors.New("长连接还在建立中，请稍等几秒再试")
+	}
+	if miss := s.wc.MissingForSend(); len(miss) > 0 {
+		return errors.New("还缺 " + strings.Join(miss, "、") + "，请先补齐再测试")
+	}
+	return s.wc.SendTemplateCard(ctx, wecom.BuildTestCard(outTrackID(0)))
+}
+
 // actionOutcome 一次按钮点击的处理结果（与具体渠道无关）。
 type actionOutcome struct {
 	Toast  string
@@ -471,7 +1026,14 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 
 	case ActionUpdate:
 		if n.CardState == model.CardUpdating {
-			return actionOutcome{Toast: "更新已在进行中"}
+			// 重复点击：不再起第二个任务，但要把卡片刷成当前状态。
+			// 早先这里返回的 State 是空的，于是一连点两下就是「两下都没反应」，
+			// 用户会以为第一次也没生效。
+			return actionOutcome{
+				Toast:  "更新已在进行中",
+				State:  model.CardUpdating,
+				Detail: "这条更新的任务已经在跑了，完成后这里会自动变成结果，不用重复点。",
+			}
 		}
 		taskID, err := s.TriggerUpdate(n, string(from))
 		if err != nil {
@@ -527,7 +1089,7 @@ func (s *Service) TriggerUpdate(n *model.Notification, triggeredBy string) (int6
 
 	task := &model.Task{
 		NotificationID: n.ID,
-		ImageRef:       TargetRef(n),
+		ImageRef:       s.updateTarget(n),
 		ContainerID:    n.ContainerID,
 		ContainerName:  n.ContainerName,
 		TriggeredBy:    triggeredBy,
@@ -552,7 +1114,7 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 	ctx, cancel := context.WithTimeout(s.baseCtx, 45*time.Minute)
 	defer cancel()
 
-	target := TargetRef(n)
+	target := s.updateTarget(n)
 	s.log.Info("开始执行更新", "task", taskID, "container", n.ContainerName,
 		"from", n.ImageRef, "target", target, "by", triggeredBy)
 
@@ -610,6 +1172,10 @@ func (s *Service) deliveryTargets(n *model.Notification) []model.Delivery {
 }
 
 // editDelivery 把某个渠道上那张卡片/消息改成最终状态。
+//
+// 这里只看「凭据还在不在」，不看开关：用户中途关掉渠道时，
+// 之前已经发出去的那张卡片仍然要改成「已完成」，
+// 否则它会永远停在「待更新」，看起来像更新根本没成功。
 func (s *Service) editDelivery(ctx context.Context, n *model.Notification, d model.Delivery, state model.CardState, detail string) {
 	switch d.Channel {
 	case model.ChannelTelegram:
@@ -628,6 +1194,28 @@ func (s *Service) editDelivery(ctx context.Context, n *model.Notification, d mod
 		if err := s.tg.EditMessageText(ctx, chatID, msgID, telegram.BuildStateMessage(n, state, detail)); err != nil {
 			s.log.Warn("更新 Telegram 消息失败", "message_id", d.MessageID, "err", err)
 		}
+
+	case model.ChannelDingTalk:
+		if !s.dg.Configured() {
+			return
+		}
+		if err := s.dg.UpdateCard(ctx, d.MessageID, dingtalk.BuildStateParams(n, state, detail)); err != nil {
+			s.log.Warn("更新钉钉卡片失败", "out_track_id", d.MessageID, "err", err)
+		}
+
+	case model.ChannelWeCom:
+		// 企业微信只能「补发一条」，不能改原来那张卡：卡片更新必须用按钮事件的
+		// req_id，而那个窗口只有 5 秒，重建容器早就超时了。
+		//
+		// 原卡片会停在「正在更新」，它的副标题里已经写明「完成后会另发一条消息」，
+		// 所以用户不会以为卡住了。
+		if !s.wc.Ready() || !s.wc.Running() {
+			return
+		}
+		if err := s.wc.SendMarkdown(ctx, wecom.BuildDoneMessage(n, state, detail)); err != nil {
+			s.log.Warn("发送企业微信结果消息失败", "ref", n.ImageRef, "err", err)
+		}
+
 	default:
 		if !s.fs.Configured() {
 			return

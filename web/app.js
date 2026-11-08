@@ -16,6 +16,8 @@ const state = {
   imageSearch: '',
   // 镜像页勾选的镜像 ID。清理是批量操作，靠它决定删哪些。
   picked: new Set(),
+  // 自检结果：当前版本、有没有新版本、更新内容与两套升级步骤
+  self: null,
 };
 
 /* ---------- 登录态 ---------- */
@@ -287,17 +289,27 @@ function renderStats() {
     statusEl.textContent = '扫描中';
     statusEl.className = 'pill info';
   } else {
-    // 两个渠道可能同时配好了，胶囊只写「已连接」，具体是哪几个挂 title 上。
-    // 写死渠道名（「飞书 已连接」）在同时配了 Telegram 时是错的。
+    // 多个渠道可能同时配好了，胶囊只写「已连接」，具体是哪几个挂 title 上。
+    // 写死渠道名（「飞书 已连接」）在同时配了别的渠道时是错的。
     const chans = (s.notify_channels || []).filter((c) => c.configured);
-    // 离线的那条把原因一起挂上：双渠道只有一个坏掉时，光看「未连接」
-    // 还得再进设置页才知道为什么，悬停一次能答完就别让人多点两次。
-    const lines = chans.map((c) => c.name + '：' + (c.online ? '已连接' : '未连接' + (c.error ? '（' + shortErr(c.error, 60) + '）' : '')));
+    const active = chans.filter((c) => c.enabled);
+    // 关掉的渠道说「已暂停」而不是「未连接」：
+    // 后者会让人以为坏了，跑去改配置；实际只是自己关的，配置好着呢。
+    const textOf = (c) => {
+      if (!c.enabled) return '已暂停';
+      return c.online ? '已连接' : '未连接' + (c.error ? '（' + shortErr(c.error, 60) + '）' : '');
+    };
+    const lines = chans.map((c) => c.name + '：' + textOf(c));
 
     if (!chans.length) {
       statusEl.textContent = '通知渠道未配置';
       statusEl.className = 'pill warn';
-    } else if (chans.some((c) => c.online)) {
+    } else if (!active.length) {
+      // 全都关着：不是故障，是用户的选择。文案别写成「未连接」。
+      statusEl.textContent = '通知已暂停';
+      statusEl.className = 'pill warn';
+      statusEl.title = lines.join('\n');
+    } else if (active.some((c) => c.online)) {
       statusEl.textContent = '已连接';
       statusEl.className = 'pill ok';
       statusEl.title = lines.join('\n');
@@ -305,8 +317,12 @@ function renderStats() {
       statusEl.textContent = '未连接';
       statusEl.className = 'pill warn';
       // 完整原因挂在 title 上，鼠标停一下就能看到，不用翻设置页。
-      statusEl.title = chans.filter((c) => c.error)
-        .map((c) => c.name + '：' + c.error).join('\n') || '凭据已填，但链路还没连上';
+      // 飞书那条给不出具体原因（它的 SDK 没有可读的错误状态），
+      // 但也不能因此整行消失 —— 否则双渠道里飞书掉了，悬停只看得到钉钉的错。
+      statusEl.title = active
+        .filter((c) => !c.online)
+        .map((c) => c.name + '：' + (c.error || '链路未就绪，稍等片刻或查看容器日志'))
+        .join('\n') || lines.join('\n');
     }
   }
 }
@@ -559,19 +575,14 @@ function renderNotifications() {
 
 // 通知渠道清单。
 //
-// ready=false 的只在页面上列出来、不能选：用户明确要求把后续要做的渠道摆出来，
-// 写「施工中」比什么都不说清楚得多。加新渠道时改这里 + 后端 Channel 枚举即可。
+// 只列**已经能用**的四个。曾经在这里摆过 Slack / Discord / Gotify / ntfy / Bark / 邮件，
+// 一律标「施工中」—— 占位摆了大半年也没做，反而让人以为「是不是我没配出来」。
+// 现在明确：企业微信是最后一个渠道，以后只维护这四个。
 const CHANNELS = [
-  { id: 'feishu', name: '飞书', ready: true },
-  { id: 'telegram', name: 'Telegram', ready: true },
-  { id: 'dingtalk', name: '钉钉', ready: false },
-  { id: 'wecom', name: '企业微信', ready: false },
-  { id: 'slack', name: 'Slack', ready: false },
-  { id: 'discord', name: 'Discord', ready: false },
-  { id: 'gotify', name: 'Gotify', ready: false },
-  { id: 'ntfy', name: 'ntfy', ready: false },
-  { id: 'bark', name: 'Bark', ready: false },
-  { id: 'smtp', name: '邮件', ready: false },
+  { id: 'feishu', name: '飞书' },
+  { id: 'telegram', name: 'Telegram' },
+  { id: 'dingtalk', name: '钉钉' },
+  { id: 'wecom', name: '企业微信' },
 ];
 
 // currentChannel 当前应该显示哪个渠道的设置。
@@ -581,8 +592,10 @@ const CHANNELS = [
 function currentChannel() {
   const s = state.settings || {};
   const ch = s.notify_channel;
-  if (ch === 'telegram' || ch === 'feishu') return ch;
+  if (ch === 'telegram' || ch === 'feishu' || ch === 'dingtalk' || ch === 'wecom') return ch;
   if (!s.feishu_app_id && s.telegram_bot_token) return 'telegram';
+  if (!s.feishu_app_id && !s.telegram_bot_token && s.dingtalk_client_id) return 'dingtalk';
+  if (!s.feishu_app_id && !s.telegram_bot_token && !s.dingtalk_client_id && s.wecom_bot_id) return 'wecom';
   return 'feishu';
 }
 
@@ -590,7 +603,38 @@ function channelConfigured(id) {
   const s = state.settings || {};
   if (id === 'feishu') return !!(s.feishu_app_id && s.feishu_app_secret);
   if (id === 'telegram') return !!s.telegram_bot_token;
+  if (id === 'dingtalk') return !!(s.dingtalk_client_id && s.dingtalk_client_secret);
+  if (id === 'wecom') return !!(s.wecom_bot_id && s.wecom_secret);
   return false;
+}
+
+// channelEnabledState 渠道总开关。
+// 后端老库缺这个字段时会按「凭据齐不齐」推导，前端只做展示。
+function channelEnabledState(id) {
+  const s = state.settings || {};
+  const v = s[id + '_enabled'];
+  if (v === true || v === false) return v;
+  return channelConfigured(id);
+}
+
+// 这个渠道离「能发出去」还差什么。
+// 钉钉要四样齐才发得出卡片，缺一样都得说清楚，不然用户只能一项项试。
+function channelMissing(id) {
+  const s = state.settings || {};
+  if (id === 'feishu') {
+    return ['feishu_app_id', 'feishu_app_secret', 'feishu_chat_id'].filter((k) => !s[k]);
+  }
+  if (id === 'telegram') {
+    return ['telegram_bot_token', 'telegram_chat_id'].filter((k) => !s[k]);
+  }
+  if (id === 'dingtalk') {
+    return ['dingtalk_client_id', 'dingtalk_client_secret', 'dingtalk_card_template_id', 'dingtalk_conversation_id']
+      .filter((k) => !s[k]);
+  }
+  if (id === 'wecom') {
+    return ['wecom_bot_id', 'wecom_secret', 'wecom_chat_id'].filter((k) => !s[k]);
+  }
+  return [];
 }
 
 // stashChannelFields 把当前可见渠道的输入暂存进 state.settings。
@@ -611,21 +655,52 @@ function stashChannelFields() {
   take('telegram_chat_id', 'telegram_chat_id');
   take('telegram_api_base', 'telegram_api_base');
   take('telegram_proxy', 'telegram_proxy');
+  take('dingtalk_client_id', 'dingtalk_client_id');
+  take('dingtalk_client_secret', 'dingtalk_client_secret');
+  take('dingtalk_card_template_id', 'dingtalk_card_template_id');
+  take('dingtalk_conversation_id', 'dingtalk_conversation_id');
+  take('wecom_bot_id', 'wecom_bot_id');
+  take('wecom_secret', 'wecom_secret');
+  take('wecom_chat_id', 'wecom_chat_id');
 }
 
 function channelChipsHtml(ch) {
   return CHANNELS.map((c) => {
-    if (!c.ready) {
-      return `<span class="channel-chip soon" aria-disabled="true">
-        <span class="chip-name">${esc(c.name)}</span>
-        <span class="chip-sub">施工中</span></span>`;
-    }
     const active = c.id === ch ? ' active' : '';
-    const sub = channelConfigured(c.id) ? '已填写凭据' : '待配置';
+    // 三种状态要分开：没配、配好了在推、配好了但用户主动关掉。
+    // 都写成「已填写凭据」的话，关掉之后看不出是暂停还是坏了。
+    let sub = '待配置';
+    if (channelConfigured(c.id)) sub = channelEnabledState(c.id) ? '已启用' : '已暂停';
     return `<button type="button" class="channel-chip${active}" data-channel="${c.id}">
       <span class="chip-name">${esc(c.name)}</span>
       <span class="chip-sub">${sub}</span></button>`;
   }).join('');
+}
+
+// channelSwitchHtml 渠道总开关。
+//
+// 关掉只停「推新提醒」：凭据、模板、会话全部保留，已发出去的卡片也照样回写状态。
+// 文案必须把「配置保留」说清楚，否则用户会担心关一下就等于清空，只能一直开着。
+function channelSwitchHtml(id, name) {
+  const on = channelEnabledState(id);
+  const ready = channelConfigured(id);
+  let hint = '填完下面的凭据、测通后会自动打开';
+  if (ready) {
+    hint = on
+      ? '发现新版本时推送到这个渠道'
+      : '已暂停：配置保留，不再推送新提醒';
+  }
+  return `
+    <div class="chan-switch">
+      <div class="sw-text">
+        <span class="sw-title">启用${esc(name)}通知</span>
+        <span class="sw-sub">${esc(hint)}</span>
+      </div>
+      <label class="sw">
+        <input type="checkbox" id="${id}_enabled" data-chan-switch="${id}" ${on ? 'checked' : ''}>
+        <span class="track"></span>
+      </label>
+    </div>`;
 }
 
 function feishuFieldsHtml(s) {
@@ -687,6 +762,164 @@ function telegramFieldsHtml(s) {
         填完直接点右边「检测连通性」—— 通了会<b>自动保存并生效</b>，不用再点保存。
       </p>
       <div id="tg-check-result" class="chat-pick" hidden></div>
+    </div>`;
+}
+
+function dingtalkFieldsHtml(s) {
+  return `
+    <div class="field">
+      <label for="dingtalk_client_id">应用 Client ID</label>
+      <input id="dingtalk_client_id" name="dingtalk_client_id" type="text"
+             value="${esc(s.dingtalk_client_id)}" placeholder="dingxxxxxxxxxxxxxxxx">
+      <p class="field-hint">钉钉开放平台 → 应用开发 → 企业内部应用 → 凭证与基础信息。</p>
+    </div>
+    <div class="field">
+      <label for="dingtalk_client_secret">应用 Client Secret</label>
+      <div class="input-row">
+        <input id="dingtalk_client_secret" name="dingtalk_client_secret" type="password"
+               value="${esc(s.dingtalk_client_secret)}" placeholder="只显示一次，复制过来">
+        <button type="button" id="btn-dt-check" class="btn ghost">检测连通性</button>
+      </div>
+      <p class="field-hint">
+        仅保存在本机数据库里。填完直接点右边检测 —— 通了会<b>自动保存</b>，
+        并立刻拉起长连接，不用再点「保存设置」。
+      </p>
+      <div id="dt-check-result" class="chat-pick" hidden></div>
+    </div>
+    <div class="field">
+      <label for="dingtalk_card_template_id">卡片模板 ID</label>
+      <input id="dingtalk_card_template_id" name="dingtalk_card_template_id" type="text"
+             value="${esc(s.dingtalk_card_template_id)}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.schema">
+      <p class="field-hint">
+        在<a href="https://open-dev.dingtalk.com/fe/card" target="_blank" rel="noreferrer">卡片平台</a>建好模板并发布后复制。
+        模板里必须有 <code>title</code>、<code>status</code>、<code>body</code> 三个变量，
+        以及回传参数为 <code>{"action":"update"}</code> 等三个按钮 —— 具体见右栏第 4 步。
+      </p>
+    </div>
+    <div class="field">
+      <label for="dingtalk_conversation_id">接收群会话 ID</label>
+      <div class="input-row">
+        <input id="dingtalk_conversation_id" name="dingtalk_conversation_id" type="text"
+               value="${esc(s.dingtalk_conversation_id)}" placeholder="cidxxxxxxxxxxxxxxxxxx==">
+        <button type="button" id="btn-dt-chats" class="btn ghost">读取会话</button>
+      </div>
+      <p class="field-hint">
+        把机器人拉进目标群，在群里<b>@它说一句话</b>，再点「读取会话」挑一条 ——
+        钉钉不提供「机器人所在群」的列表接口，只能等它在群里收到消息时自己报上来。
+      </p>
+      <div id="dt-chat-list" class="chat-pick" hidden></div>
+    </div>`;
+}
+
+function wecomFieldsHtml(s) {
+  return `
+    <div class="field">
+      <label for="wecom_bot_id">机器人 BotID</label>
+      <input id="wecom_bot_id" name="wecom_bot_id" type="text"
+             value="${esc(s.wecom_bot_id)}" placeholder="企业微信智能机器人的 BotID">
+      <p class="field-hint">
+        管理后台 → <b>智能专区</b> → 智能机器人 → 选中机器人 → 「API 配置」里能看到。
+      </p>
+    </div>
+    <div class="field">
+      <label for="wecom_secret">长连接 Secret</label>
+      <input id="wecom_secret" name="wecom_secret" type="password"
+             value="${esc(s.wecom_secret)}" placeholder="只显示一次，复制过来">
+      <p class="field-hint">
+        同一页「API 模式 → 长连接」下方那个 Secret。注意<b>不是</b>接收 URL 模式的
+        Token / EncodingAESKey，两者不通用，填错了会一直连不上。
+        仅保存在本机数据库里；保存后自动建立长连接。
+      </p>
+    </div>
+    <div class="field">
+      <label for="wecom_chat_id">接收会话</label>
+      <div class="input-row">
+        <input id="wecom_chat_id" name="wecom_chat_id" type="text"
+               value="${esc(s.wecom_chat_id)}" placeholder="群聊填 chatid，单聊填 userid">
+        <button type="button" id="btn-wc-chats" class="btn ghost">读取会话</button>
+      </div>
+      <p class="field-hint">
+        把机器人加进目标群，在群里 <b>@它说一句话</b>（单聊就直接给它发一句），
+        再点「读取会话」挑一条 —— 企业微信没有「机器人所在群」的接口，
+        只能等它在会话里收到消息时自己报上来。
+      </p>
+      <div id="wc-chat-list" class="chat-pick" hidden></div>
+    </div>`;
+}
+
+// wecomStatusText 右栏「当前状态」那一行。
+//
+// 长连接状态只能从后端问：企业微信没有独立的「检测」接口，
+// 认证就是建立长连接本身，连上了才算凭据对、网络通。
+function wecomStatusText() {
+  const s = state.settings || {};
+  const st = state.wecom || {};
+  if (!s.wecom_bot_id || !s.wecom_secret) {
+    return '未配置，发现新版本只会记录在「通知」标签里';
+  }
+  if (st.running) return '已配置，长连接在线';
+  return '已配置，但长连接未建立' +
+    (st.last_error ? `：${st.last_error}` : '（保存后稍等几秒，或看容器日志）');
+}
+
+async function refreshWeComStatus() {
+  try {
+    state.wecom = await api('/api/wecom/status');
+  } catch (_) {
+    return;
+  }
+  // 只更新那一行，不重绘整块：重绘会把用户展开的步骤折叠回去。
+  const el = $('#wc-live-status');
+  if (el) el.textContent = wecomStatusText();
+}
+
+function wecomGuideHtml() {
+  return `
+    <div class="guide-card">
+      <h3>企业微信 · 配置流程</h3>
+      <p class="field-hint">
+        配置完后发现新版本会往企业微信推一张带按钮的卡片，点按钮直接重建容器。
+        走<b>长连接</b>，不需要公网地址、不需要域名备案、也不用加解密。
+      </p>
+      <p class="field-hint">当前状态：<b id="wc-live-status">${esc(wecomStatusText())}</b></p>
+      <details class="setup-guide" open>
+        <summary>共 6 步，第一次配置照着做</summary>
+        <ol class="setup-steps">
+          <li>
+            <b>建机器人</b>：<a href="https://work.weixin.qq.com/wework_admin/frame" target="_blank" rel="noreferrer">企业微信管理后台</a>
+            → <b>智能专区</b> → <b>智能机器人</b> → 创建 → 新建机器人，
+            创建方式选 <b>「API 模式创建」</b>，名字随意。
+          </li>
+          <li>
+            <b>开长连接</b>：同一个创建页，右侧「API 配置」选<b>「使用长连接」</b>。
+          </li>
+          <li>
+            <b>授权能力</b>：往下「使用模式 → 可使用权限」点<b>「去授权」</b>，
+            勾上 <b>消息</b>（发卡片要用）与 <b>通讯录</b>（认得出是谁在 @ 它），
+            文档、邮件、待办、日程、会议、微盘都不用勾；「使用方式」选 <b>「多人使用」</b>，
+            否则只有你自己能点卡片上的按钮。
+          </li>
+          <li>
+            <b>取凭据</b>：同一页拿到 <code>BotID</code> 与<b>长连接专用</b>
+            <code>Secret</code>，填到左侧两项，点「保存设置」。
+          </li>
+          <li>
+            <b>取会话</b>：把机器人加进目标群，在群里 @它 说一句话（单聊就直接发一句），
+            然后点左侧「读取会话」挑一条填入。<br>
+            <span class="field-hint">只有<b>企业内部群</b>能加机器人；互联群、上下游群、
+            外部群都加不进去，硬拉会收不到任何消息。</span>
+          </li>
+          <li>
+            <b>验证</b>：点下方「发送企业微信测试卡片」，卡片到了再点一下卡片上的任意按钮 ——
+            卡片当场变样，才算「发得出去 + 收得回按钮」两条链路都通。
+          </li>
+        </ol>
+      </details>
+      <p class="field-hint">
+        有一个与其它渠道不同的限制：<b>卡片只能在点按钮后 5 秒内更新</b>。
+        所以点完按钮卡片会变成「正在更新」，更新结果会<b>另发一条消息</b> ——
+        原来那张卡片会一直停在「正在更新」，这是协议限制，不是坏了。
+      </p>
     </div>`;
 }
 
@@ -811,11 +1044,133 @@ function telegramGuideHtml() {
     </div>`;
 }
 
+function dingtalkGuideHtml() {
+  const s = state.settings || {};
+  const configured = channelConfigured('dingtalk');
+  const live = state.stats && state.stats.dingtalk_stream;
+  let statusText = '未配置，发现新版本只会记录在「通知」标签里';
+  if (configured) {
+    statusText = live
+      ? '已配置，Stream 长连接运行中'
+      : '已配置，但长连接尚未就绪（保存后稍等片刻，或看下方说明）';
+  }
+  return `
+    <div class="guide-card">
+      <h3>钉钉 · 配置流程</h3>
+      <p class="field-hint">
+        和飞书一样：发现新版本推一张卡片，点卡片上的按钮直接重建容器。
+        本应用用 <b>Stream 长连接</b>接收按钮回调，不需要公网地址、不需要域名备案，
+        也不需要公网 IP。
+      </p>
+      <p class="field-hint">当前状态：<b>${esc(statusText)}</b></p>
+      <details class="setup-guide" open>
+        <summary>共 6 步，第一次配置照着做</summary>
+        <ol class="setup-steps">
+          <li>
+            <b>建应用</b>：打开
+            <a href="https://open-dev.dingtalk.com/" target="_blank" rel="noreferrer">钉钉开放平台</a> →
+            「应用开发 → <b>钉钉应用</b>」→ 创建应用。
+            建好后在「凭证与基础信息」里复制 <code>Client ID</code> 与
+            <code>Client Secret</code> 填到左边。
+            <br>
+            <span class="field-hint">
+              注意：左侧还有一个与「钉钉应用」<b>并列</b>的「机器人」入口，那个是旧模型，
+              钉钉官方已说明「将逐渐退出历史舞台，不要用它来创建」。本流程需要的卡片模板关联、
+              权限、版本发布都在「钉钉应用」详情页里，从应用入口建才能一条路走完。
+            </span>
+          </li>
+          <li>
+            <b>加机器人</b>：在刚建好的应用里，左侧「应用能力」→ 机器人 → 添加/配置。
+            <b>除「消息接收模式」外，其余五项全是必填</b>，少一项发布不了：
+            <ul class="scope-list">
+              <li>机器人名称：<code>AutoDocker</code>（群里显示的就是它）</li>
+              <li>机器人图标：建议 240×240 方形，可用项目里的 <code>fnos/ICON_256.PNG</code></li>
+              <li>机器人简介：<b>最多 10 个字符</b>，例如 <code>镜像更新提醒</code></li>
+              <li>机器人描述：<b>最多 200 字符</b>，写清「发现新版本推卡片、点按钮重建容器」</li>
+              <li>机器人消息预览图：png/jpg、<b>不超过 2M</b>，可用一张界面截图</li>
+              <li>消息接收模式：<b>Stream</b>（不是 HTTP，选了 HTTP 就得填公网地址）</li>
+            </ul>
+            <span class="field-hint">
+              简介和描述会出现在群成员「添加机器人」时的列表里 —— 写成「机器人1号」那种，
+              别人不知道是干什么的、也就不会去加。改完机器人配置要去
+              「版本管理与发布」发新版本，否则群里看到的还是旧信息。
+            </span>
+          </li>
+          <li>
+            <b>开权限</b>：左侧「权限管理」，搜到下面两项并开通：
+            <ul class="scope-list">
+              <li><code>Card.Instance.Write</code>（互动卡片实例写权限）</li>
+              <li><code>qyapi_robot_sendmsg</code>（企业内机器人发送消息）</li>
+            </ul>
+          </li>
+          <li>
+            <b>建卡片模板</b>：打开
+            <a href="https://open-dev.dingtalk.com/fe/card" target="_blank" rel="noreferrer">卡片平台</a>
+            → 新建模板 → 按下面「模板怎么搭」拖好组件 → <b>发布</b> →
+            复制模板 ID（形如 <code>xxxx-xxxx.schema</code>）填到左边。
+          </li>
+          <li>
+            <b>发布应用版本</b>：左侧「版本管理与发布」→ 创建版本 → 发布。
+            <b>改了权限、机器人或模板却不发布新版本，等于什么都没改</b> ——
+            现象是配置看着全对，发卡片一直报权限或模板错误。
+          </li>
+          <li>
+            <b>拉群并取会话 ID</b>：钉钉群里 → 群设置 → 智能群助手 → 添加机器人 →
+            选你刚建的那个；然后在群里 <b>@它说一句话</b>，回来点左边「读取会话」，
+            列表里会冒出这个群，点一下即自动填入并保存。
+          </li>
+        </ol>
+      </details>
+
+      <details class="setup-guide">
+        <summary>第 4 步的模板怎么搭（变量名要一字不差）</summary>
+        <p class="field-hint">
+          钉钉不允许代码定义卡片长什么样，只能先在平台搭好骨架、代码往里填数据。
+          所以下面这些名字是硬约定，写错了卡片发出去就是一片空白。
+        </p>
+        <ul class="scope-list">
+          <li>标题：<b>文本</b>组件，变量名 <code>title</code></li>
+          <li>状态：<b>文本</b>组件，变量名 <code>status</code>（放右上角当小标签即可）</li>
+          <li>正文：<b>Markdown</b>组件，变量名 <code>body</code></li>
+        </ul>
+        <p class="field-hint">
+          再放三个按钮，每个都配「回传请求」，参数分别填：
+        </p>
+        <ul class="scope-list">
+          <li>立即更新 → <code>{"action":"update"}</code></li>
+          <li>稍后提醒 → <code>{"action":"snooze"}</code></li>
+          <li>忽略本版本 → <code>{"action":"ignore"}</code></li>
+        </ul>
+        <p class="field-hint">
+          代码只认 <code>params.action</code>，不认按钮 ID，所以排版随你怎么调都不会坏。
+          测试卡片用的是同一个模板，点上面任意一个按钮都算「回调验证通过」。
+        </p>
+      </details>
+
+      <p class="field-hint">
+        点按钮没反应时按顺序看：先点上面的「检测连通性」——
+        它只验凭据和出网，一次把这两件事说清；连通之后还收不到卡片，
+        才去看模板有没有发布、按钮的回传参数有没有配对。
+        卡片收到了但点了没变化，多半是第 5 步的版本没发布。
+      </p>
+    </div>`;
+}
+
 function renderGuide(ch) {
   const guide = $('#settings-guide');
   if (!guide) return;
   if (ch === 'telegram') {
     guide.innerHTML = telegramGuideHtml();
+    return;
+  }
+  if (ch === 'dingtalk') {
+    guide.innerHTML = dingtalkGuideHtml();
+    return;
+  }
+  if (ch === 'wecom') {
+    guide.innerHTML = wecomGuideHtml();
+    // 状态要去后端问一次：长连接是否在线只有服务端知道。
+    refreshWeComStatus();
     return;
   }
   guide.innerHTML = feishuGuideHtml();
@@ -824,8 +1179,21 @@ function renderGuide(ch) {
 function renderSettings() {
   const s = state.settings;
   if (!s) return;
+  const selfSt = state.self || {};
   const ch = currentChannel();
-  const testLabel = ch === 'telegram' ? '发送测试消息' : '发送飞书测试卡片';
+  const chName = { feishu: '飞书', telegram: 'Telegram', dingtalk: '钉钉', wecom: '企业微信' }[ch] || '飞书';
+  const testLabel = {
+    feishu: '发送飞书测试卡片',
+    telegram: '发送测试消息',
+    dingtalk: '发送钉钉测试卡片',
+    wecom: '发送企业微信测试卡片',
+  }[ch] || '发送测试卡片';
+  const fields = {
+    feishu: feishuFieldsHtml,
+    telegram: telegramFieldsHtml,
+    dingtalk: dingtalkFieldsHtml,
+    wecom: wecomFieldsHtml,
+  }[ch](s);
 
   $('#settings-form').innerHTML = `
     <div class="field">
@@ -840,10 +1208,11 @@ function renderSettings() {
     </div>
 
     <h3 class="form-section">通知渠道</h3>
-    <p class="field-hint">发现新版本时把提醒推到哪里。<b>填好凭据的渠道都会收到</b>，右栏是当前所选渠道的完整配置流程 —— 选谁只决定改哪一份配置，不影响另一个照常推送。</p>
+    <p class="field-hint">发现新版本时把提醒推到哪里。<b>开着开关、凭据齐全的渠道都会收到</b>；关掉某个渠道只是不再推新提醒，配置一项都不会丢。右栏是当前所选渠道的完整配置流程 —— 选谁只决定改哪份配置。</p>
     <div class="channel-picker">${channelChipsHtml(ch)}</div>
-    <p class="field-hint">灰色的渠道还在做，暂时不能选。</p>
-    ${ch === 'telegram' ? telegramFieldsHtml(s) : feishuFieldsHtml(s)}
+    <p class="field-hint">企业微信是最后一个渠道 —— 这四个之外不再增加新的。</p>
+    ${channelSwitchHtml(ch, chName)}
+    ${fields}
 
     <div class="notify-test">
       <button type="button" id="btn-test-notify" class="btn ghost">${testLabel}</button>
@@ -899,12 +1268,257 @@ function renderSettings() {
     <p class="field-hint">更新动作始终由人确认：提醒消息里点「立即更新」，或在此页「容器」标签点「更新」。
       环境变量 <code>AUTO_UPDATE=true</code> 可改为发现即更新，该开关不在本页展示，保存设置不会改动它。</p>
 
+    <h3 class="form-section">关于</h3>
+    <div class="about">
+      <div class="about-main">
+        <div class="about-title">AutoDocker <b>${esc(selfSt.current || 'dev')}</b></div>
+        <p class="field-hint" id="about-hint">${esc(aboutHint())}</p>
+      </div>
+      <button type="button" class="btn ghost" id="btn-selfcheck">检查更新</button>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="check_updates" ${s.check_updates ? 'checked' : ''}>
+      每天检查一次新版本（只提示，不会自动升级）
+    </label>
+    <p class="field-hint">
+      更新提示只在页面里显示，不会推到通知渠道。
+      项目地址 <a class="link" href="${esc(selfSt.repo_url || GITHUB_URL)}" target="_blank" rel="noreferrer">${esc(selfSt.repo_url || GITHUB_URL)}</a>
+    </p>
+
+    <div class="selfnet">
+      <p class="field-hint">
+        查版本时会先直连 GitHub，连不上会自动换公共加速（gh-proxy.com 等），
+        <b>两格都留空就能用</b>。只有下面两种情况才需要填。
+      </p>
+      <div class="field">
+        <label for="selfcheck_proxy">代理地址</label>
+        <input id="selfcheck_proxy" name="selfcheck_proxy" type="text" value="${esc(s.selfcheck_proxy || '')}"
+               placeholder="http://192.168.1.2:7890">
+        <p class="field-hint">
+          NAS 上跑着 Clash 之类就填它的端口 —— <code>http://</code> 与 <code>socks5h://</code> 都认。
+          填了就不再走公共加速，因为代理比它快也稳。
+        </p>
+      </div>
+      <div class="field">
+        <label for="selfcheck_mirror">加速前缀</label>
+        <input id="selfcheck_mirror" name="selfcheck_mirror" type="text" value="${esc(s.selfcheck_mirror || '')}"
+               placeholder="https://gh-proxy.com/">
+        <p class="field-hint">
+          只想用某个固定的加速服务时才填，写法是 <code>前缀 + https://github.com/…</code>。
+          填了就一直用它，不再自动换。
+        </p>
+      </div>
+    </div>
+
     <div class="form-actions">
       <button type="submit" class="btn primary">保存设置</button>
     </div>
   `;
 
   renderGuide(ch);
+}
+
+/* ---------- 自检更新 ---------- */
+
+// 后端只负责「告诉你有没有新版本」，升级动作一律由用户自己做：
+// 飞牛包归应用中心，Docker 归 compose。这两个地方都不归本程序管，
+// 替它们动手一旦失败，用户手上就没有能救回来的办法。
+const GITHUB_URL = 'https://github.com/haihaipypy/autodocker';
+
+// 上一次看的是哪一栏（飞牛 / Docker），重开弹窗时沿用
+let updateForm = '';
+// 页面上每个「复制」按钮对应一条命令，按下标取，避免把多行命令塞进 HTML 属性
+let updateCmds = [];
+
+function aboutHint() {
+  const st = state.self || {};
+  // 后端已经把「为什么失败、下一步怎么办」写全了，这里别再套一层
+  if (st.error) return st.error;
+  if (st.dev_build) return '开发构建，不参与版本比较。';
+  // 直连不通时后端会自动走公共加速，把它标出来 —— 出问题时这是第一条线索
+  const via = st.via ? ' · 经 ' + mirrorHost(st.via) + ' 加速' : '';
+  if (st.has_update) return '发现新版本 ' + st.latest + '，顶栏的「有新版本」里有更新内容和升级步骤。';
+  if (st.checked_at) return '已是最新版本 · ' + fmtTime(st.checked_at) + ' 检查' + via;
+  return '还没检查过。';
+}
+
+// mirrorHost 把加速前缀缩成域名，提示里只放这个就够看
+function mirrorHost(u) {
+  return String(u || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+}
+
+async function loadSelfCheck() {
+  try {
+    state.self = await api('/api/selfcheck');
+  } catch (_) {
+    // 自检只是锦上添花，接口挂了不该影响主界面
+    return;
+  }
+  renderSelfCheckPill();
+  refreshAbout();
+}
+
+// refreshAbout 只改「关于」那两行，不整块重绘设置页 ——
+// 设置页是表单，重绘会把用户还没保存的改动抹掉。
+// 首次打开时设置页比自检结果先渲染出来，版本号会停在 dev，得在这里补一次。
+function refreshAbout() {
+  const ver = document.querySelector('.about-title b');
+  if (ver) ver.textContent = (state.self && state.self.current) || 'dev';
+  const hint = $('#about-hint');
+  if (hint) hint.textContent = aboutHint();
+}
+
+function renderSelfCheckPill() {
+  const el = $('#selfcheck-pill');
+  if (!el) return;
+  const st = state.self || {};
+  // 没新版本就彻底不占位 —— 顶栏已经够挤了
+  el.hidden = !st.has_update;
+  if (!st.has_update) return;
+  el.textContent = '新版本 ' + (st.latest || '');
+  el.title = '当前 ' + (st.current || 'dev') + '，点开看更新内容与升级步骤';
+}
+
+function openUpdateModal() {
+  renderUpdateModal();
+  $('#update-modal').hidden = false;
+}
+
+function closeUpdateModal() {
+  const m = $('#update-modal');
+  if (m) m.hidden = true;
+}
+
+// noteLineHtml 把 Release 正文的一行渲染成弹窗里的一行。
+// 只认 `#` 小标题、`-` 列表、`**加粗**`、反引号 —— 够用，犯不上为这点东西引个 markdown 库。
+function noteLineHtml(line) {
+  let s = String(line || '').trim();
+  let cls = 'note-p';
+  if (/^#{1,6}\s/.test(s)) {
+    cls = 'note-h';
+    s = s.replace(/^#{1,6}\s*/, '');
+  } else if (/^[-*]\s/.test(s)) {
+    cls = 'note-li';
+    s = s.replace(/^[-*]\s*/, '');
+  } else if (/^>\s?/.test(s)) {
+    cls = 'note-quote';
+    s = s.replace(/^>\s?/, '');
+  }
+  let html = esc(s);
+  html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return `<div class="${cls}">${html}</div>`;
+}
+
+function currentGuide() {
+  const st = state.self || {};
+  const list = st.guides || [];
+  if (!list.length) return null;
+  const want = updateForm || st.deploy_form || '';
+  return list.find((g) => g.key === want) || list[0];
+}
+
+function renderUpdateModal() {
+  const st = state.self || {};
+  const body = $('#update-body');
+  if (!body) return;
+
+  const title = $('#update-title');
+  if (title) title.textContent = st.has_update ? '发现新版本' : '版本信息';
+
+  const list = st.guides || [];
+  const active = currentGuide();
+  updateCmds = [];
+
+  const versions = st.latest
+    ? `<div class="update-versions">
+         <span class="ver">当前 ${esc(st.current || 'dev')}</span>
+         <span class="ver-arrow">→</span>
+         <span class="ver new">最新 ${esc(st.latest)}</span>
+         <span class="hint">${st.checked_at ? esc(fmtTime(st.checked_at)) + ' 检查' : ''}</span>
+       </div>`
+    : `<p class="field-hint">${esc(st.error || '还没查到最新版本')}</p>`;
+
+  const notes = (st.notes || []).length
+    ? `<div class="notes">${st.notes.map(noteLineHtml).join('')}</div>`
+    : `<p class="field-hint">这次没拿到 Release 说明，完整内容见 <a class="link" href="${esc(st.release_url || GITHUB_URL + '/releases')}" target="_blank" rel="noreferrer">发布页</a>。</p>`;
+
+  const tabs = list.length > 1
+    ? `<div class="update-tabs">${list.map((g) => `
+        <button type="button" class="update-tab${active && g.key === active.key ? ' active' : ''}" data-form="${esc(g.key)}">${esc(g.title)}</button>`).join('')}
+      </div>`
+    : '';
+
+  const steps = (active && active.steps) || [];
+  const stepsHtml = steps.map((step, i) => {
+    let cmd = '';
+    if (step.cmd) {
+      const idx = updateCmds.push(step.cmd) - 1;
+      cmd = `<div class="cmd">
+               <pre>${esc(step.cmd)}</pre>
+               <button type="button" class="btn ghost small" data-copy="${idx}">复制</button>
+             </div>`;
+    }
+    return `<li><span class="step-no">${i + 1}</span><div class="step-body"><span>${esc(step.text)}</span>${cmd}</div></li>`;
+  }).join('');
+
+  body.innerHTML = `
+    ${versions}
+    <h4 class="update-sub">更新内容</h4>
+    ${notes}
+    <h4 class="update-sub">怎么升级</h4>
+    <p class="field-hint">${esc(active ? active.hint : '')}</p>
+    ${tabs}
+    <ol class="steps">${stepsHtml}</ol>
+    <div class="update-links">
+      <a class="link" href="${esc(st.repo_url || GITHUB_URL)}" target="_blank" rel="noreferrer">项目地址</a>
+      <a class="link" href="${esc(st.release_url || GITHUB_URL + '/releases')}" target="_blank" rel="noreferrer">Release 页</a>
+    </div>
+  `;
+}
+
+// copyText 复制命令。http 页面没有安全上下文，navigator.clipboard 用不了，
+// 退回 textarea + execCommand —— 局域网里访问 NAS 基本都是 http，这条退路是主路。
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) { /* 落到下面的老办法 */ }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+  ta.remove();
+  return ok;
+}
+
+async function runSelfCheck() {
+  const btn = $('#btn-selfcheck');
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+  try {
+    state.self = await api('/api/selfcheck', { method: 'POST' });
+    renderSelfCheckPill();
+    refreshAbout();
+    // 手动点检查就一定要给个结果：新版本弹「发现新版本」，已经最新弹「版本信息」。
+    // 只弹 toast 的话，用户看不到更新内容与升级步骤，等于只回答了一半问题。
+    openUpdateModal();
+    if (state.self.has_update) {
+      toast('发现新版本 ' + state.self.latest);
+    } else if (state.self.error) {
+      toast(state.self.error, 'warn');
+    } else {
+      toast('已是最新版本');
+    }
+  } catch (e) {
+    toast('检查失败：' + e.message, 'danger');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || '检查更新'; }
+  }
 }
 
 /* ---------- 数据加载 ---------- */
@@ -949,7 +1563,7 @@ async function loadSettings() {
 async function refresh(opts) {
   const quiet = !!(opts && opts.quiet);
   try {
-    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications()]);
+    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications(), loadSelfCheck()]);
   } catch (e) {
     // 轮询触发的刷新失败不提示：局域网抖一下是常事，下一轮自己会好，
     // 每隔几秒弹一次红条反而比数据旧一会儿更烦人。
@@ -1206,7 +1820,25 @@ function settingsPayload() {
     telegram_chat_id: cur.telegram_chat_id || '',
     telegram_api_base: cur.telegram_api_base || '',
     telegram_proxy: cur.telegram_proxy || '',
+    dingtalk_client_id: cur.dingtalk_client_id || '',
+    dingtalk_client_secret: cur.dingtalk_client_secret || '',
+    dingtalk_card_template_id: cur.dingtalk_card_template_id || '',
+    dingtalk_conversation_id: cur.dingtalk_conversation_id || '',
+    wecom_bot_id: cur.wecom_bot_id || '',
+    wecom_secret: cur.wecom_secret || '',
+    wecom_chat_id: cur.wecom_chat_id || '',
+    // 四个开关必须每次都回传：后端把「缺字段」当成「没设置过」，
+    // 会退回按凭据推导，用户显式关掉的状态就丢了。
+    feishu_enabled: channelEnabledState('feishu'),
+    telegram_enabled: channelEnabledState('telegram'),
+    dingtalk_enabled: channelEnabledState('dingtalk'),
+    wecom_enabled: channelEnabledState('wecom'),
     registry_mirror: $('#registry_mirror').value.trim(),
+    // 自检开关每次都要带上，否则保存一次设置就把用户关掉的检查又打开了
+    check_updates: $('#check_updates') ? $('#check_updates').checked : true,
+    // 这两个也是「留空即直连」，所以空串要如实回传，不能丢字段
+    selfcheck_proxy: ($('#selfcheck_proxy') ? $('#selfcheck_proxy').value : '').trim(),
+    selfcheck_mirror: ($('#selfcheck_mirror') ? $('#selfcheck_mirror').value : '').trim(),
     admin_user: ($('#admin_user').value || '').trim(),
     admin_password: $('#admin_password').value || '',
     rollback_on_failure: $('#rollback_on_failure').checked,
@@ -1251,13 +1883,49 @@ async function saveSettings(ev) {
   renderSettings();
 
   const mirrorChanged = (prev.registry_mirror || '') !== payload.registry_mirror;
+  // 代理/前缀刚改完，用户要的就是「检查更新能不能通」。顺手在后台试一次，
+  // 免得他保存完还得多点一下才知道填对没填对。
+  const netChanged = (prev.selfcheck_proxy || '') !== payload.selfcheck_proxy
+    || (prev.selfcheck_mirror || '') !== payload.selfcheck_mirror;
+  if (netChanged) {
+    reconnectSelfCheck();
+    toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '已保存，正在用新配置试一次检查更新…');
+    return;
+  }
   toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '设置已保存并生效');
+}
+
+// reconnectSelfCheck 换了 GitHub 连接方式后静默试一次，结果落在「关于」那一行。
+async function reconnectSelfCheck() {
+  try {
+    state.self = await api('/api/selfcheck', { method: 'POST' });
+  } catch (_) {
+    return;
+  }
+  renderSelfCheckPill();
+  refreshAbout();
+  if (state.self.error) {
+    toast(state.self.error, 'warn');
+  } else {
+    toast(state.self.has_update ? '已保存，发现新版本 ' + state.self.latest : '已保存，检查更新正常');
+  }
 }
 
 // notifyStatusURL 各渠道的链路状态地址。
 function notifyStatusURL(ch) {
+  if (ch === 'dingtalk') return '/api/dingtalk/status';
+  if (ch === 'wecom') return '/api/wecom/status';
   return ch === 'telegram' ? '/api/telegram/status' : '/api/feishu/status';
 }
+
+// 各渠道「点什么、在哪点」的文案。四个渠道的说法完全不一样，
+// 写死一句「请到群里点一下」会让人在钉钉里找飞书卡片。
+const PICK_HINT = {
+  feishu: '请到飞书群里点一下卡片上的按钮',
+  telegram: '请在 Telegram 里点一下消息上的按钮',
+  dingtalk: '请在钉钉群里点一下卡片上的按钮',
+  wecom: '请在企业微信会话里点一下卡片上的按钮',
+};
 
 // testNotify 给当前渠道发一条测试消息，然后盯着按钮回调。
 //
@@ -1275,11 +1943,15 @@ async function testNotify() {
     base = st.callback_count || 0;
   } catch (_) { /* 状态读不到不影响发消息 */ }
 
+  const testURL = ch === 'telegram'
+    ? '/api/telegram/test'
+    : (ch === 'dingtalk'
+      ? '/api/dingtalk/test'
+      : (ch === 'wecom' ? '/api/wecom/test' : '/api/feishu/test'));
+
   try {
-    await api(ch === 'telegram' ? '/api/telegram/test' : '/api/feishu/test', { method: 'POST' });
-    toast(ch === 'telegram'
-      ? '测试消息已发送，请在 Telegram 里点一下消息上的按钮'
-      : '测试卡片已发送，请到飞书群里点一下卡片上的按钮');
+    await api(testURL, { method: 'POST' });
+    toast('测试消息已发送，' + (PICK_HINT[ch] || PICK_HINT.feishu));
   } catch (e) {
     toast('发送失败：' + e.message, 'danger');
     if (btn) btn.disabled = false;
@@ -1295,9 +1967,7 @@ function waitCallback(base, ch) {
   if (!el) return;
   el.hidden = false;
   el.className = 'callback-state waiting';
-  el.textContent = ch === 'telegram'
-    ? '⏳ 等待按钮回调…请在 Telegram 里点一下消息上的按钮'
-    : '⏳ 等待按钮回调…请在飞书群里点一下卡片上的按钮';
+  el.textContent = '⏳ 等待按钮回调…' + (PICK_HINT[ch] || PICK_HINT.feishu);
 
   let left = 45; // 45 次 × 2 秒 = 90 秒
   const timer = setInterval(async () => {
@@ -1305,24 +1975,90 @@ function waitCallback(base, ch) {
     if (left <= 0) {
       clearInterval(timer);
       el.className = 'callback-state bad';
-      el.innerHTML = ch === 'telegram'
-        ? '未收到按钮回调。请确认 bot 没在别处设过 webhook（它与长轮询互斥），' +
-          '并查看设置页上方的长轮询状态与容器日志。'
-        : '未收到按钮回调。请检查「回调配置」里是否加了 <code>card.action.trigger</code>，' +
+      if (ch === 'dingtalk') {
+        el.innerHTML = '未收到按钮回调。请检查：① 卡片模板里三个按钮是否都配了「回传请求」，' +
+          '参数是否写成 <code>{"action":"update"}</code> 这种形式；' +
+          '② 改完模板后是否<b>重新发布了应用版本</b>；③ 机器人是否还在那个群里。';
+      } else if (ch === 'wecom') {
+        el.innerHTML = '未收到按钮回调。请检查：① 机器人配置页的「API 模式」是否选了<b>「长连接」</b>；' +
+          '② 填的 Secret 是不是<b>长连接专用</b>那个（不是接收 URL 模式的 Token）；' +
+          '③ 右栏「当前状态」里长连接是否显示在线；④ 机器人是否还在那个会话里。';
+      } else if (ch === 'telegram') {
+        el.innerHTML = '未收到按钮回调。请确认 bot 没在别处设过 webhook（它与长轮询互斥），' +
+          '并查看设置页上方的长轮询状态与容器日志。';
+      } else {
+        el.innerHTML = '未收到按钮回调。请检查「回调配置」里是否加了 <code>card.action.trigger</code>，' +
           '以及改完权限/回调后是否<b>发布了新版本</b>。';
+      }
       return;
     }
     try {
       const st = await api(notifyStatusURL(ch));
-      // 两个渠道共用一个回调计数器，必须再核一次「这次回调来自本渠道」。
+      // 三个渠道共用一个回调计数器，必须再核一次「这次回调来自本渠道」。
       if ((st.callback_count || 0) > base && st.last_channel === ch) {
         clearInterval(timer);
         el.className = 'callback-state ok';
         const t = st.last_callback_at ? fmtTime(Date.parse(st.last_callback_at)) : '';
         el.textContent = '✅ 已收到按钮回调' + (t ? '（' + t + '）' : '') + '，按钮链路正常';
+        // 测通即视为「我要用它」：开关本来是关的就顺手打开并保存。
+        if (!channelEnabledState(ch)) enableChannelAfterTest(ch);
       }
     } catch (_) { /* 单次失败忽略，下一轮重试 */ }
   }, 2000);
+}
+
+// enableChannelAfterTest 测通后自动打开该渠道的开关并保存。
+//
+// 用户点「发送测试」的意图本来就是「我要用它」，测通了还要再去拨一下开关，
+// 纯属多一道会忘的操作。只在这个渠道原本是关的时候才动，避免覆盖用户的显式选择。
+async function enableChannelAfterTest(ch) {
+  if (!state.settings) return;
+  state.settings[ch + '_enabled'] = true;
+  const name = (CHANNELS.find((c) => c.id === ch) || {}).name || ch;
+  try {
+    await persistSettings();
+    // 保存会重绘整块表单，原来的结果框已经不在文档里，重新取一次填回去。
+    renderSettings();
+    const out = $('#notify-callback-state');
+    if (out) {
+      out.hidden = false;
+      out.className = 'callback-state ok';
+      out.textContent = '✅ 按钮链路正常，已自动启用「' + name + '」通知';
+    }
+    loadStats();
+  } catch (e) {
+    toast('已测通，但自动启用失败：' + e.message, 'danger');
+  }
+}
+
+// toggleChannelSwitch 拨动某个渠道的总开关，立即保存。
+//
+// 即时保存而不是等「保存设置」：用户拨开关的意图就是此刻生效，
+// 若还要再点一次保存，很容易漏掉 —— 然后以为开关坏了。
+async function toggleChannelSwitch(ch, on) {
+  if (!state.settings) return;
+  // 先把输入框里的值收进 state，否则刚填完还没保存的凭据会被判成「没配」
+  stashChannelFields();
+
+  const name = (CHANNELS.find((c) => c.id === ch) || {}).name || ch;
+  if (on && !channelConfigured(ch)) {
+    toast('先把 ' + name + ' 的凭据填完，再打开开关', 'danger');
+    renderSettings(); // 勾选框恢复成关闭状态
+    return;
+  }
+
+  state.settings[ch + '_enabled'] = on;
+  try {
+    await persistSettings();
+    renderSettings();
+    loadStats();
+    toast(on
+      ? '已启用「' + name + '」通知'
+      : '已暂停「' + name + '」通知，配置已保留');
+  } catch (e) {
+    toast('保存失败：' + e.message, 'danger');
+    renderSettings();
+  }
 }
 
 // checkTelegram 只验证「连不连得上 + Token 对不对」。
@@ -1441,7 +2177,7 @@ async function loadTelegramChats() {
     }
     box.className = 'chat-pick';
     box.innerHTML = chats.map((c) => `
-      <button type="button" class="chat-item" data-chat="${esc(c.id)}">
+      <button type="button" class="chat-item" data-chat="${esc(c.id)}" data-field="telegram_chat_id">
         <span class="chat-title">${esc(c.title || c.id)}</span>
         <span class="chat-id mono">${esc(c.id)}</span>
       </button>`).join('');
@@ -1453,8 +2189,172 @@ async function loadTelegramChats() {
   }
 }
 
-function renderRegistryTest(res) {
-  const rows = (res.results || []).map((r) => `
+// checkDingTalk 只验「凭据对不对、能不能连上钉钉」。
+//
+// 刻意不要求模板与会话：「发送测试卡片」必须先有这两样才跑得起来，
+// 报出来的却是「还缺卡片模板」，人就跑去折腾模板，而真正的问题在别处。
+async function checkDingTalk() {
+  const box = $('#dt-check-result');
+  const btn = $('#btn-dt-check');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  box.hidden = false;
+  box.className = 'chat-pick loading';
+  box.textContent = '正在连接钉钉…';
+  try {
+    const r = await api('/api/dingtalk/check', {
+      method: 'POST',
+      body: JSON.stringify({
+        dingtalk_client_id: ($('#dingtalk_client_id') || {}).value || '',
+        dingtalk_client_secret: ($('#dingtalk_client_secret') || {}).value || '',
+      }),
+    });
+    box.className = 'chat-pick empty';
+    if (r.ok) {
+      // 检测用输入框里的值、长连接用已保存的值：只填不保存时检测永远是通的，
+      // 「读取会话」却一直是空的 —— 现象上像检测在骗人。通了就直接存下来。
+      const saved = state.settings || {};
+      const dirty = ['dingtalk_client_id', 'dingtalk_client_secret']
+        .some((k) => (saved[k] || '').trim() !== ((($('#' + k) || {}).value || '').trim()));
+
+      let note;
+      if (dirty) {
+        try {
+          await persistSettings();
+          // 保存会重绘表单，原来的结果框已经不在文档里，重新取一次填回去。
+          renderSettings();
+          note = '<p class="chat-ok">✓ 已自动保存，长连接正在建立</p>';
+        } catch (e) {
+          note = `<p class="chat-warn">⚠ 检测通过，但保存失败：${esc(e.message)}
+            —— 点页面底部「保存设置」重试。</p>`;
+        }
+      } else {
+        note = '<p class="hint-text">这份配置已经保存过了。</p>';
+      }
+
+      const out = $('#dt-check-result') || box;
+      out.hidden = false;
+      out.className = 'chat-pick empty';
+      out.innerHTML = `<p class="chat-ok">✓ 凭据有效，能正常调用钉钉接口</p>
+        <p class="hint-text">接着填卡片模板 ID 与会话 ID，再点上面的「发送钉钉测试卡片」。</p>${note}`;
+      return;
+    }
+    box.innerHTML = `<p class="chat-err">${esc(r.error || '未知错误')}</p>
+      <p>这里失败说明是<b>凭据写错</b>或<b>这台机器连不上 api.dingtalk.com</b>，
+      跟卡片模板、会话 ID 都没关系。</p>`;
+  } catch (e) {
+    box.className = 'chat-pick empty';
+    box.innerHTML = `<p class="chat-err">检测失败：${esc(e.message)}</p>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// loadDingTalkChats 读取机器人在钉钉上收到过消息的会话。
+//
+// 钉钉没有「机器人所在群列表」这种接口，会话 ID 只能在机器人收到消息时
+// 随着回调带上来 —— 所以「先在群里 @它 说句话」是必须的，不是多余的步骤。
+async function loadDingTalkChats() {
+  const box = $('#dt-chat-list');
+  const btn = $('#btn-dt-chats');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  box.hidden = false;
+  box.className = 'chat-pick loading';
+  box.textContent = '读取中…';
+  try {
+    const st = await api('/api/dingtalk/status');
+    const chats = st.chats || [];
+    if (!chats.length) {
+      box.className = 'chat-pick empty';
+      const err = st.last_error ? `<p class="chat-err">长连接报错：${esc(st.last_error)}</p>` : '';
+      const body = st.last_error
+        ? `<p><b>先解决连不上的问题：</b>点上面的「检测连通性」跑通，再回来读会话。</p>`
+        : `<p><b>钉钉不会主动告诉服务「机器人在哪些群」</b>，只有机器人在群里收到一条消息时，
+             才会把会话 ID 一起带上来。</p>
+           <p>① 确认机器人已经加进目标群；<br>
+              ② 在群里 <code>@机器人 说句话</code>；<br>
+              ③ 回来再点一次「读取会话」。</p>
+           <p class="field-hint">收到一次就够了 —— 会话会存进数据库，之后重启、装新包都不用再 @。</p>`;
+      // 底下一行是「服务实际在用什么配置」：读不到会话时这三项比任何文案都管用
+      const diag = [
+        '长连接：' + (st.stream ? '运行中' : (st.configured ? '未运行' : '凭据未配置')),
+        '会话：' + (st.conversation_id || '未填'),
+        '还缺：' + ((st.missing || []).join('、') || '无'),
+      ].join(' · ');
+      box.innerHTML = `<p>还没收到过任何消息。</p>${err}${body}
+        <p class="chat-diag mono">${esc(diag)}</p>`;
+      return;
+    }
+    box.className = 'chat-pick';
+    box.innerHTML = chats.map((c) => `
+      <button type="button" class="chat-item" data-chat="${esc(c.id)}" data-field="dingtalk_conversation_id">
+        <span class="chat-title">${esc(c.title || c.id)}</span>
+        <span class="chat-id mono">${esc(c.id)}</span>
+      </button>`).join('') +
+      // 这句是给用户吃定心丸的：早先版本这份列表只在内存里，装个包重启就空了，
+      // 每次都得重新 @ 一次机器人。现在落库了，得让人看得见这个变化。
+      `<p class="field-hint">列表已存进数据库，重启后仍在；只有加了一个新群才需要再 @ 一次机器人。</p>`;
+  } catch (e) {
+    box.className = 'chat-pick empty';
+    box.textContent = '读取失败：' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// loadWeComChats 读取机器人在企业微信上收到过消息的会话。
+//
+// 与钉钉同一套逻辑：企业微信也没有「机器人所在群列表」接口，
+// 会话 ID 只能在它收到消息时随回调带上来。
+async function loadWeComChats() {
+  const box = $('#wc-chat-list');
+  const btn = $('#btn-wc-chats');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  box.hidden = false;
+  box.className = 'chat-pick loading';
+  box.textContent = '读取中…';
+  try {
+    const st = await api('/api/wecom/status');
+    state.wecom = st;
+    const chats = st.chats || [];
+    if (!chats.length) {
+      box.className = 'chat-pick empty';
+      const err = st.last_error ? `<p class="chat-err">长连接报错：${esc(st.last_error)}</p>` : '';
+      const body = st.last_error
+        ? '<p><b>先解决连不上的问题：</b>长连接没建立时，机器人收不到任何消息。</p>'
+        : `<p><b>企业微信不会主动告诉服务「机器人在哪些群」</b>，只有机器人在会话里收到一条消息时，
+             才会把会话 ID 一起带上来。</p>
+           <p>① 确认机器人已经加进目标群；<br>
+              ② 在群里 <code>@机器人 说句话</code>（单聊就直接发一句）；<br>
+              ③ 回来再点一次「读取会话」。</p>
+           <p class="field-hint">收到一次就够了 —— 会话会存进数据库，之后重启、装新包都不用再 @。</p>`;
+      const diag = [
+        '长连接：' + (st.running ? '运行中' : (st.configured ? '未运行' : '凭据未配置')),
+        '会话：' + (st.chat_id || '未填'),
+        '还缺：' + ((st.missing || []).join('、') || '无'),
+      ].join(' · ');
+      box.innerHTML = `<p>还没收到过任何消息。</p>${err}${body}
+        <p class="chat-diag mono">${esc(diag)}</p>`;
+      return;
+    }
+    box.className = 'chat-pick';
+    box.innerHTML = chats.map((c) => `
+      <button type="button" class="chat-item" data-chat="${esc(c.id)}" data-field="wecom_chat_id">
+        <span class="chat-title">${esc(c.title || c.id)}</span>
+        <span class="chat-id mono">${esc(c.id)}</span>
+      </button>`).join('') +
+      '<p class="field-hint">列表已存进数据库，重启后仍在；只有加了一个新群才需要再 @ 一次机器人。</p>';
+  } catch (e) {
+    box.className = 'chat-pick empty';
+    box.textContent = '读取失败：' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderRegistryTest(res) {  const rows = (res.results || []).map((r) => `
     <div class="test-line ${r.ok ? 'ok' : 'bad'}">
       <span class="test-host mono">${esc(r.label)}${r.mirror ? '<i class="tag-mini">加速</i>' : ''}</span>
       <span class="test-res">${r.ok
@@ -1544,6 +2444,7 @@ document.addEventListener('click', async (ev) => {
 
   if (ev.target.closest('[data-close-modal]')) {
     closeCleanModal();
+    closeUpdateModal();
     return;
   }
 
@@ -1594,17 +2495,21 @@ document.addEventListener('click', async (ev) => {
     return;
   }
 
-  // 点会话即填入 chat_id 并直接保存。
-  // 那串负数没人愿意抄，填进去却还要再点一次「保存设置」，等于白填。
+  // 点会话即填入并直接保存。
+  // 那串负数（飞书/Telegram）或 cid 开头的长串（钉钉）没人愿意抄，
+  // 填进去却还要再点一次「保存设置」，等于白填。
   const chatItem = ev.target.closest('.chat-item[data-chat]');
   if (chatItem) {
-    const input = $('#telegram_chat_id');
+    const field = chatItem.dataset.field || 'telegram_chat_id';
+    const input = $('#' + field);
     if (input) input.value = chatItem.dataset.chat;
-    const box = $('#tg-chat-list');
-    if (box) box.hidden = true;
+    const box = $('#dt-chat-list');
+    const tgBox = $('#tg-chat-list');
+    if (field === 'dingtalk_conversation_id' && box) box.hidden = true;
+    if (field === 'telegram_chat_id' && tgBox) tgBox.hidden = true;
     try {
       await persistSettings();
-      // 保存成功要重绘：渠道胶囊的「已填写凭据」、顶栏状态都得跟着变。
+      // 保存成功要重绘：渠道胶囊的「已启用/已暂停」、顶栏状态都得跟着变。
       renderSettings();
       toast('已填入会话 ID 并保存');
     } catch (e) {
@@ -1613,11 +2518,34 @@ document.addEventListener('click', async (ev) => {
     return;
   }
 
+  // 升级步骤里的命令：按 data-copy 下标取原文，不从 DOM 里回读 —— pre 里带换行，
+  // textContent 取回来会被浏览器规整过，粘出去就变形了
+  const copyBtn = ev.target.closest('button[data-copy]');
+  if (copyBtn) {
+    const text = updateCmds[Number(copyBtn.dataset.copy)];
+    if (text) {
+      copyText(text).then((ok) => toast(ok ? '已复制' : '复制失败，请手动选中命令', ok ? 'ok' : 'warn'));
+    }
+    return;
+  }
+
+  const upTab = ev.target.closest('.update-tab[data-form]');
+  if (upTab) {
+    updateForm = upTab.dataset.form;
+    renderUpdateModal();
+    return;
+  }
+
+  if (ev.target.id === 'selfcheck-pill') openUpdateModal();
+  if (ev.target.id === 'btn-selfcheck') runSelfCheck();
   if (ev.target.id === 'btn-scan') doScan(false);
   if (ev.target.id === 'btn-force') doScan(true);
   if (ev.target.id === 'btn-test-notify') testNotify();
   if (ev.target.id === 'btn-tg-chats') loadTelegramChats();
   if (ev.target.id === 'btn-tg-check') checkTelegram();
+  if (ev.target.id === 'btn-dt-chats') loadDingTalkChats();
+  if (ev.target.id === 'btn-wc-chats') loadWeComChats();
+  if (ev.target.id === 'btn-dt-check') checkDingTalk();
   if (ev.target.id === 'btn-test-registry') testRegistry();
   if (ev.target.id === 'btn-clean') openCleanModal();
   if (ev.target.id === 'btn-clean-ok') doClean();
@@ -1654,6 +2582,12 @@ document.addEventListener('input', (ev) => {
 });
 
 document.addEventListener('change', (ev) => {
+  const sw = ev.target.closest('input[data-chan-switch]');
+  if (sw) {
+    toggleChannelSwitch(sw.dataset.chanSwitch, sw.checked);
+    return;
+  }
+
   const sel = ev.target.closest('select[data-mode]');
   if (sel) {
     setMode(Number(sel.dataset.mode), sel.value);
